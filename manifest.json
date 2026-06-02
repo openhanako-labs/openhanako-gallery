@@ -1,0 +1,69 @@
+{
+  "manifestVersion": 1,
+  "id": "hanako-gallery",
+  "name": "Hanako Gallery",
+  "version": "0.3.0",
+  "description": "图库管理插件：导入、搜索、标签、缩略图、Markdown 引用。",
+  "minAppVersion": "0.0.0",
+  "trust": "full-access",
+  "contributes": {
+    "page": {
+      "title": { "zh": "图库画廊", "en": "Gallery" },
+      "icon": "<svg viewBox='0 0 24 24' fill='none' stroke='#6aa7ff' stroke-width='1.5'><rect x='3' y='3' width='18' height='18' rx='3'/><circle cx='9' cy='9' r='2'/><path d='M3 16l5-5 3 3 4-4 6 6'/></svg>",
+      "route": "/gallery"
+    },
+    "tools": [
+      { "source": "tools/ping.js" },
+      { "source": "tools/config.js" },
+      { "source": "tools/import.js" },
+      { "source": "tools/search.js" },
+      { "source": "tools/tag.js" },
+      { "source": "tools/markdown.js" },
+      { "source": "tools/generate.js" },
+      { "source": "tools/export.js" },
+      { "source": "tools/rebuild.js" },
+      { "source": "tools/sync.js" }
+    ],
+    "configuration": {
+      "properties": {
+        "gallery.galleryRoot": {
+          "type": "string",
+          "default": "",
+          "title": "图库根目录",
+          "description": "图片本体存储根路径"
+        },
+        "gallery.scanPaths": {
+          "type": "array",
+          "items": { "type": "string" },
+          "default": [],
+          "title": "扫描路径列表",
+          "description": "从哪些目录扫描图片入库"
+        },
+        "gallery.thumbnailSize": {
+          "type": "number",
+          "default": 300,
+          "title": "缩略图宽度",
+          "description": "缩略图生成宽度（像素）"
+        },
+        "gallery.autoClassify": {
+          "type": "boolean",
+          "default": true,
+          "title": "自动分类",
+          "description": "是否按 EXIF 日期自动分目录"
+        },
+        "gallery.defaultView": {
+          "type": "string",
+          "default": "date",
+          "title": "默认排序",
+          "description": "搜索结果的默认排序方式"
+        },
+        "gallery.blogImagesPath": {
+          "type": "string",
+          "default": "public/images/gallery",
+          "title": "博客图片目录",
+          "description": "博客项目中图片目录的相对路径，Markdown 引用从此路径推算"
+        }
+      }
+    }
+  }
+}
