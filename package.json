@@ -1,0 +1,12 @@
+{
+  "name": "hanako-gallery",
+  "version": "0.3.0",
+  "private": true,
+  "type": "module",
+  "description": "Hanako 图库管理插件",
+  "dependencies": {
+    "exifr": "^7.1.3",
+    "sharp": "^0.33.5",
+    "sql.js": "^1.11.0"
+  }
+}
