@@ -1,23 +1,15 @@
-/**
- * routes/gallery.js - Gallery page + API routes
- */
+// gallery.js - Gallery page + API routes
 import fs from 'node:fs';
 import path from 'node:path';
 
 export default function (app, ctx) {
   const pluginDir = ctx.pluginDir;
-  const normalizePath = (p) => p.replace(/\\/g, '/');
+  const normalizePath = (p) => (typeof p !== 'string' ? '' : p).replace(/\\/g, '/');
+  let _SQL_module = null;
 
   app.get('/gallery', async (c) => {
-    const htmlPath = path.join(pluginDir, 'pages', 'gallery.html');
-    try {
-      const theme = c.req.query('hana-theme') || 'dark';
-      let html = fs.readFileSync(htmlPath, 'utf-8');
-      html = html.replace('<body', '<body data-hana-theme="' + theme.replace(/["'`<>]/g, '') + '" data-surface="page"');
-      return c.html(html);
-    } catch {
-      return c.html('<html><body data-hana-theme="dark" data-surface="page" style="background:#faf8f0;color:#5a4a3a;display:flex;align-items:center;justify-content:center;height:100vh"><h1>Gallery</h1></body></html>');
-    }
+    const html = fs.readFileSync(path.join(pluginDir, 'pages', 'gallery.html'), 'utf-8');
+    return c.html(html);
   });
 
   /* ── Search ── */
@@ -25,29 +17,125 @@ export default function (app, ctx) {
     try {
       const { initDb, queryAll, queryOne } = await import('../lib/db.js');
       await initDb(ctx);
+
+      const page = parseInt(c.req.query('page') || '1', 10);
+      const pageSize = Math.min(parseInt(c.req.query('pageSize') || '50', 10), 500);
       const keyword = c.req.query('keyword') || '';
       const tag = c.req.query('tag') || '';
-      const pageSize = parseInt(c.req.query('pageSize') || '50', 10);
-      const page = Math.max(1, parseInt(c.req.query('page') || '1', 10));
+      const sort = c.req.query('sort') || 'date_desc';
+      const ratio = c.req.query('ratio') || '';
+      const showGenerated = c.req.query('showGenerated') !== 'false';
+      const showVideo = c.req.query('showVideo') === 'true';
       const offset = (page - 1) * pageSize;
-      const conditions = ['hidden = 0']; const params = [];
-      if (keyword) { conditions.push('(filename LIKE ? OR path LIKE ?)'); params.push('%' + keyword + '%', '%' + keyword + '%'); }
 
-      // 总数
-      const totalRow = queryOne('SELECT COUNT(*) as cnt FROM images ' + (conditions.length ? 'WHERE ' + conditions.join(' AND ') : ''), params.slice());
-      const total = totalRow ? totalRow.cnt : 0;
+      // ── 1. 查询本地 images 表 ──
+      let totalLocal = 0;
+      let allResults = [];
+
+      const conditions = ['hidden = 0'];
+      const params = [];
+      if (keyword) { conditions.push('(filename LIKE ? OR path LIKE ?)'); params.push('%' + keyword + '%', '%' + keyword + '%'); }
+      if (tag) {
+        conditions.push('id IN (SELECT image_id FROM image_tags WHERE tag_id IN (SELECT id FROM tags WHERE name = ?))');
+        params.push(tag);
+      }
+      if (ratio) {
+        if (ratio === 'favorite') conditions.push("id IN (SELECT image_id FROM image_tags WHERE tag_id IN (SELECT id FROM tags WHERE name = '☆收藏'))");
+        else if (ratio === 'wide') conditions.push('CAST(width AS REAL) / CAST(height AS REAL) > 1.2');
+        else if (ratio === 'tall') conditions.push('CAST(width AS REAL) / CAST(height AS REAL) < 0.8');
+        else if (ratio === 'square') conditions.push('CAST(width AS REAL) / CAST(height AS REAL) BETWEEN 0.9 AND 1.1');
+      }
+
+      const totalRow = queryOne('SELECT COUNT(*) as cnt FROM images WHERE ' + conditions.join(' AND '), params.slice());
+      totalLocal = totalRow ? totalRow.cnt : 0;
+
+      let sortClause = 'date_taken DESC';
+      if (sort === 'date_asc') sortClause = 'date_taken ASC';
+      else if (sort === 'name_asc') sortClause = 'filename ASC';
+      else if (sort === 'name_desc') sortClause = 'filename DESC';
+      else if (sort === 'size_desc') sortClause = 'size_bytes DESC';
+      else if (sort === 'size_asc') sortClause = 'size_bytes ASC';
+
+      let localRows = queryAll(
+        'SELECT id, filename, ext, path, size_bytes, width, height, date_taken, date_imported FROM images WHERE ' + conditions.join(' AND ') + ' ORDER BY ' + sortClause + ' LIMIT ? OFFSET ?',
+        [...params, pageSize, offset]
+      );
+
+      const { getImageTags } = await import('../lib/tagger.js');
+      localRows.forEach(function(img) {
+        allResults.push({
+          id: img.id, path: img.path, filename: img.filename, ext: img.ext,
+          size_bytes: img.size_bytes, width: img.width, height: img.height,
+          date_taken: img.date_taken, date_imported: img.date_imported,
+          source: 'import', media_type: 'image',
+          tags: getImageTags(img.id),
+          prompt: null, model_id: null,
+          favorited: 0
+        });
+      });
+
+      // ── 2. 扫描 image-gen 生成目录（AI 生成） ──
+      let totalGen = 0;
+      if (showGenerated) {
+        // 从 hanako 数据目录读取 image-gen 路径，不硬编码
+        const os = await import('os');
+        const hanakoHome = process.env.HANAKO_DATA_DIR || path.join(os.homedir(), '.hanako');
+        const genDir = path.join(hanakoHome, 'plugin-data', 'image-gen', 'generated');
+        if (fs.existsSync(genDir)) {
+          const genItems = [];
+          const files = fs.readdirSync(genDir);
+          for (const f of files) {
+            const fp = path.join(genDir, f);
+            try { if (!fs.statSync(fp).isFile()) continue; } catch(_) { continue; }
+            const ext = path.extname(f).toLowerCase();
+            const isImg = ['.png','.jpg','.jpeg','.webp','.gif'].includes(ext);
+            const isVid = ['.mp4','.webm','.mov','.avi','.mkv'].includes(ext);
+            if (!isImg && !isVid) continue;
+            if (!showVideo && isVid) continue;
+            if (keyword && !f.toLowerCase().includes(keyword.toLowerCase())) continue;
+            try {
+              const stat = fs.statSync(fp);
+              genItems.push({
+                id: 'gen_' + f,
+                path: fp,
+                filename: f,
+                ext: ext.replace('.',''),
+                size_bytes: stat.size,
+                width: 0, height: 0,
+                date_taken: stat.mtime.toISOString(),
+                date_imported: stat.mtime.toISOString(),
+                source: 'generated',
+                media_type: isVid ? 'video' : 'image',
+                tags: [], prompt: null, model_id: null,
+                favorited: 0
+              });
+            } catch(_) {}
+          }
+          genItems.sort((a,b) => new Date(b.date_taken) - new Date(a.date_taken));
+          totalGen = genItems.length;
+          const pageItems = genItems.slice(offset, offset + Math.min(pageSize, 500));
+          pageItems.forEach(function(img) {
+            const dup = allResults.find(function(a){ return a.path === img.path; });
+            if (!dup) allResults.push(img);
+          });
+        }
+      }
+
+      // ── 3. 合并总数和分页 ──
+      const total = totalLocal + totalGen;
       const totalPages = Math.max(1, Math.ceil(total / pageSize));
 
-      // 分页查询
-      let rows = queryAll('SELECT * FROM images ' + (conditions.length ? 'WHERE ' + conditions.join(' AND ') : '') + ' ORDER BY COALESCE(date_taken, date_imported) DESC LIMIT ? OFFSET ?', [...params, Math.min(pageSize, 500), offset]);
-      if (tag) {
-        const { findImagesByTags } = await import('../lib/tagger.js');
-        const ids = new Set(findImagesByTags([tag]).map(function(r){ return r.image_id; }));
-        rows = rows.filter(function(r){ return ids.has(r.id); });
-      }
-      const { getImageTags } = await import('../lib/tagger.js');
-      const results = rows.map(function(img){ return { id: img.id, path: img.path, filename: img.filename, ext: img.ext, size_bytes: img.size_bytes, width: img.width, height: img.height, date_taken: img.date_taken, date_imported: img.date_imported, tags: getImageTags(img.id) }; });
-      return c.json({ status: 'ok', count: results.length, total, page, totalPages, pages: totalPages, results: results });
+      return c.json({
+        status: 'ok',
+        count: allResults.length,
+        total: total,
+        page: page,
+        totalPages: totalPages,
+        pages: totalPages,
+        results: allResults,
+        totalLocal: totalLocal,
+        totalGenerated: totalGen
+      });
     } catch (e) { ctx.log.warn('search error:', e.message); return c.json({ status: 'error', error: e.message }, 500); }
   });
 
@@ -57,76 +145,91 @@ export default function (app, ctx) {
       const { initDb } = await import('../lib/db.js');
       await initDb(ctx);
       const { listTags } = await import('../lib/tagger.js');
-      return c.json({ status: 'ok', count: 0, tags: listTags(true) });
+      const tags = listTags(true);
+      return c.json({ status: 'ok', count: tags.length, tags: tags });
     } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
   });
 
-  /* ── Image file ── */
+  /* ── Image/Video file ── */
   app.get('/api/gallery/image/:id', async (c) => {
     try {
       const id = c.req.param('id'); if (!id) return c.json({ error: 'missing id' }, 400);
       const { initDb, queryOne } = await import('../lib/db.js');
       await initDb(ctx);
-      const img = queryOne('SELECT path FROM images WHERE id = ?', [id]);
+
+      // 先查 images 表
+      let img = queryOne('SELECT path FROM images WHERE id = ?', [id]);
+      let source = 'import';
+
+      // 没找到，检查是否是 gen_ 开头（image-gen generated）
+      if (!img && id.startsWith('gen_')) {
+        const filename = id.substring(4); // 去掉 gen_
+        const os = await import('os');
+        const hanakoHome = process.env.HANAKO_DATA_DIR || path.join(os.homedir(), '.hanako');
+        const genDir = path.join(hanakoHome, 'plugin-data', 'image-gen', 'generated');
+        const fp = path.join(genDir, filename);
+        if (fs.existsSync(fp)) {
+          img = { path: fp };
+          source = 'generated';
+        }
+      }
+
       if (!img) return c.json({ error: 'not found' }, 404);
+
       // 外部链接：重定向
       if (img.path && img.path.startsWith('ext:')) {
         const externalUrl = img.path.substring(4);
         return c.redirect(externalUrl, 302);
       }
-      // 纯索引模式：path 是绝对路径
-      const fp = img.path;
-      if (!fs.existsSync(fp)) return c.json({ error: 'file not found on disk' }, 404);
-      const ext = path.extname(fp).toLowerCase();
-      const mime = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp' };
-      return c.body(fs.readFileSync(fp), 200, { 'Content-Type': mime[ext] || 'application/octet-stream' });
-    } catch (e) { ctx.log.warn('image error:', e.message); return c.json({ error: e.message }, 500); }
-  });
 
-  /* ── Config: GET ── */
-  app.get('/api/gallery/config', async (c) => {
-    try {
-      const { initDb, queryAll, queryOne } = await import('../lib/db.js');
-      await initDb(ctx);
+      const filePath = img.path;
+      if (!fs.existsSync(filePath)) return c.json({ error: 'file not found on disk' }, 404);
 
-      // 从 SQLite config 表读取持久化的 scanPaths
-      let dbScanPaths = [];
-      try {
-        const row = queryOne("SELECT value FROM config WHERE key = 'scanPaths'");
-        if (row && row.value) {
-          dbScanPaths = JSON.parse(row.value);
-        }
-      } catch (_) { /* config 表可能不存在 */ }
-
-      // 优先使用数据库里的 scanPaths，否则回退到 ctx.config
-      const scanPaths = dbScanPaths.length > 0 ? dbScanPaths : ([]).concat(ctx.config?.['gallery.scanPaths'] || [[]]);
-
-      return c.json({
-        status: 'ok',
-        config: {
-          galleryRoot: ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery'),
-          scanPaths: scanPaths,
-          thumbnailSize: ctx.config?.['gallery.thumbnailSize'] || 300,
-          autoClassify: ctx.config?.['gallery.autoClassify'] ?? true,
-          blogImagesPath: ctx.config?.['gallery.blogImagesPath'] || 'public/images/gallery'
+      const ext = path.extname(filePath).toLowerCase();
+      const mimeTypes = {
+        '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png',
+        '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp',
+        '.mp4': 'video/mp4', '.webm': 'video/webm', '.mov': 'video/quicktime'
+      };
+      const mime = mimeTypes[ext] || 'application/octet-stream';
+      const data = fs.readFileSync(filePath);
+      return new Response(new Uint8Array(data), {
+        headers: {
+          'Content-Type': mime,
+          'Cache-Control': 'public, max-age=3600'
         }
       });
     } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
   });
 
-  /* ── Config: POST (save via ctx) ── */
+  /* ── Config ── */
+  app.get('/api/gallery/config', async (c) => {
+    try {
+      const { initDb, queryOne } = await import('../lib/db.js');
+      await initDb(ctx);
+      const galleryRoot = queryOne("SELECT value FROM config WHERE key = 'galleryRoot'")?.value || ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
+      const blogImagesPath = queryOne("SELECT value FROM config WHERE key = 'blogImagesPath'")?.value || ctx.config?.['gallery.blogImagesPath'] || 'public/images/gallery';
+      const thumbnailSize = parseInt(queryOne("SELECT value FROM config WHERE key = 'thumbnailSize'")?.value || ctx.config?.['gallery.thumbnailSize'] || '300');
+      const autoClassify = ctx.config?.['gallery.autoClassify'] !== false;
+      const scanRow = queryOne("SELECT value FROM config WHERE key = 'scanPaths'");
+      let scanPaths = [];
+      try { scanPaths = JSON.parse(scanRow?.value || '[]'); } catch(_) {}
+      if (!Array.isArray(scanPaths)) scanPaths = [];
+      return c.json({ status: 'ok', config: { galleryRoot, scanPaths, thumbnailSize, autoClassify, blogImagesPath } });
+    } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
+  });
+
   app.post('/api/gallery/config', async (c) => {
     try {
       const body = await c.req.json();
       const { initDb, runSql, flush, queryOne, queryAll, closeDb, getDb } = await import('../lib/db.js');
-      // 先关闭旧实例，强制从磁盘重新加载（确保 ALTER TABLE 的列变更生效）
       if (getDb()) closeDb(ctx);
       await initDb(ctx);
 
-      // scanPaths 直接写入 SQLite 的配置表
       if (body.scanPaths && Array.isArray(body.scanPaths)) {
+        const cleanPaths = body.scanPaths.filter(p => typeof p === 'string' && p.trim()).map(p => p.trim());
         const existing = queryOne("SELECT * FROM config WHERE key = 'scanPaths'");
-        const val = JSON.stringify(body.scanPaths);
+        const val = JSON.stringify(cleanPaths);
         if (existing) {
           runSql("UPDATE config SET value = ? WHERE key = 'scanPaths'", [val]);
         } else {
@@ -134,18 +237,32 @@ export default function (app, ctx) {
         }
       }
 
-      // 清理：当新 scanPaths 中不存在的路径，删除该来源目录下的图片记录 + 缩略图（不删源文件）
-      const newPaths = body.scanPaths || [];
+      // 保存 galleryRoot, blogImagesPath, thumbnailSize
+      if (typeof body.galleryRoot === 'string' && body.galleryRoot.trim()) {
+        const existing = queryOne("SELECT * FROM config WHERE key = 'galleryRoot'");
+        if (existing) runSql("UPDATE config SET value = ? WHERE key = 'galleryRoot'", [body.galleryRoot.trim()]);
+        else runSql("INSERT INTO config (key, value) VALUES ('galleryRoot', ?)", [body.galleryRoot.trim()]);
+      }
+      if (typeof body.blogImagesPath === 'string' && body.blogImagesPath.trim()) {
+        const existing = queryOne("SELECT * FROM config WHERE key = 'blogImagesPath'");
+        if (existing) runSql("UPDATE config SET value = ? WHERE key = 'blogImagesPath'", [body.blogImagesPath.trim()]);
+        else runSql("INSERT INTO config (key, value) VALUES ('blogImagesPath', ?)", [body.blogImagesPath.trim()]);
+      }
+      if (body.thumbnailSize) {
+        const existing = queryOne("SELECT * FROM config WHERE key = 'thumbnailSize'");
+        if (existing) runSql("UPDATE config SET value = ? WHERE key = 'thumbnailSize'", [String(body.thumbnailSize)]);
+        else runSql("INSERT INTO config (key, value) VALUES ('thumbnailSize', ?)", [String(body.thumbnailSize)]);
+      }
+
+      const newPaths = (body.scanPaths || []).filter(p => typeof p === 'string' && p.trim());
       if (body._oldPaths && Array.isArray(body._oldPaths)) {
-        const oldPathsSet = new Set(body._oldPaths);
+        const oldPathsSet = new Set(body._oldPaths.filter(p => typeof p === 'string'));
         const keepSet = new Set(newPaths);
-        const removed = oldPathsSet.difference(keepSet);
-        if (removed.size > 0) {
-          const galleryRoot = ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
-          for (const oldPath of removed) {
+        for (const oldPath of oldPathsSet) {
+          if (!keepSet.has(oldPath)) {
             const oldPathNorm = normalizePath(oldPath);
             const rows = queryAll("SELECT id, thumbnail_path FROM images WHERE source_path = ?", [oldPathNorm]);
-            let cleaned = 0;
+            const galleryRoot = ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
             for (const row of rows) {
               if (row.thumbnail_path) {
                 const thumbFp = path.resolve(galleryRoot, row.thumbnail_path);
@@ -153,14 +270,11 @@ export default function (app, ctx) {
               }
               runSql("DELETE FROM image_tags WHERE image_id = ?", [row.id]);
               runSql("DELETE FROM images WHERE id = ?", [row.id]);
-              cleaned++;
             }
-            if (cleaned > 0) ctx.log.info(`Removed ${cleaned} images from deleted path: ${oldPath}`);
           }
         }
       }
 
-      // 其他配置项暂不持久化（仍需在 Hanako 设置中修改）
       ctx.log.info('gallery config update requested:', JSON.stringify(body));
       flush();
       return c.json({ status: 'ok', message: '配置已更新' });
@@ -171,13 +285,15 @@ export default function (app, ctx) {
   app.post('/api/gallery/rebuild', async (c) => {
     try {
       const galleryRoot = ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
-      const { initDb, runSql, flush, queryOne, closeDb, getDb } = await import('../lib/db.js');
-      // 强制刷新 DB 实例，确保 schema 变更生效
-      if (getDb()) closeDb(ctx);
+      const { initDb, runSql } = await import('../lib/db.js');
       await initDb(ctx);
-      const { rebuildIndex } = await import('../lib/scanner.js');
-      const result = await rebuildIndex(galleryRoot);
-      return c.json({ status: 'ok', ...result });
+      const { scanImport: scanDirectories } = await import('../lib/scanner.js');
+      const scanRow = (await import('../lib/db.js')).queryOne("SELECT value FROM config WHERE key = 'scanPaths'");
+      let scanPaths = [];
+      try { scanPaths = JSON.parse(scanRow?.value || '[]'); } catch(_) {}
+      if (!Array.isArray(scanPaths)) scanPaths = [];
+      const stats = scanDirectories(scanPaths, galleryRoot, ctx);
+      return c.json({ status: 'ok', ...stats });
     } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
   });
 
@@ -185,131 +301,116 @@ export default function (app, ctx) {
   app.post('/api/gallery/import', async (c) => {
     try {
       const body = await c.req.json();
-      const galleryRoot = ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
-      const autoClassify = ctx.config?.['gallery.autoClassify'] ?? true;
-      // 优先使用前端传来的 paths，否则用配置的 scanPaths
-      const scanPaths = (body.paths && Array.isArray(body.paths) && body.paths.length) 
-        ? body.paths 
-        : [].concat(ctx.config?.['gallery.scanPaths'] || [[]]);
-      const { initDb, closeDb, getDb } = await import('../lib/db.js');
-      if (getDb()) closeDb(ctx);
-      await initDb(ctx);
-      const { scanImport } = await import('../lib/scanner.js');
-      let totalImported = 0;
-      for (const sp of scanPaths) {
-        const r = await scanImport(galleryRoot, sp, autoClassify);
-        totalImported += r.summary.imported;
-      }
-      return c.json({ status: 'ok', totalImported: totalImported });
-    } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
-  });
-
-  /* ── Rename image ── */
-  app.post('/api/gallery/rename', async (c) => {
-    try {
-      const body = await c.req.json();
-      const id = body.id; const name = body.name;
-      if (!id || !name) return c.json({ status: 'error', error: 'missing id or name' }, 400);
-      const { initDb, runSql, flush, queryOne } = await import('../lib/db.js');
-      await initDb(ctx);
-      // 从数据库获取实际扩展名
-      const img = queryOne('SELECT ext FROM images WHERE id = ?', [id]);
-      if (!img) return c.json({ status: 'error', error: 'image not found' }, 404);
-      runSql('UPDATE images SET filename = ? WHERE id = ?', [name + '.' + img.ext, id]);
-      flush();
-      return c.json({ status: 'ok' });
-    } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
-  });
-
-  /* ── Tag image ── */
-  app.post('/api/gallery/tag', async (c) => {
-    try {
-      const body = await c.req.json();
-      const id = body.id; const tags = body.tags;
-      if (!id || !tags) return c.json({ status: 'error', error: 'missing id or tags' }, 400);
       const { initDb } = await import('../lib/db.js');
       await initDb(ctx);
-      const { addTags, removeTags } = await import('../lib/tagger.js');
-      if (body.action === 'remove') removeTags([id], tags);
-      else addTags([id], Array.isArray(tags) ? tags : [tags]);
-      return c.json({ status: 'ok' });
+      const { scanImport: importFromDirectory } = await import('../lib/scanner.js');
+      const galleryRoot = ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
+      const stats = importFromDirectory(body.path, galleryRoot, ctx);
+      return c.json({ status: 'ok', ...stats });
     } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
   });
 
-  /* Import from URL */
-  app.post('/api/gallery/import-url', async (c) => {
+  /* ── Tag management ── */
+  app.get('/api/gallery/tag/list', async (c) => {
     try {
-      const body = await c.req.json();
-      const url = body.url;
-      if (!url) return c.json({ status: 'error', error: 'missing url' }, 400);
-      const galleryRoot = ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
-      const importDir = galleryRoot + '/netimports';
-      if (!fs.existsSync(importDir)) fs.mkdirSync(importDir, { recursive: true });
-      const urlPath = new URL(url).pathname;
-      const ext = urlPath.substring(urlPath.lastIndexOf('.')) || '.jpg';
-      const filename = 'url_' + Date.now() + '.jpg';
-      const filepath = importDir + '/' + filename;
-      const resp = await fetch(url);
-      if (!resp.ok) return c.json({ status: 'error', error: 'download failed: ' + resp.status }, 400);
-      const buf = Buffer.from(await resp.arrayBuffer());
-      fs.writeFileSync(filepath, buf);
-      // 自动入库：用 scanImport 导入到图库
       const { initDb } = await import('../lib/db.js');
       await initDb(ctx);
-      const { scanImport } = await import('../lib/scanner.js');
-      const result = await scanImport(galleryRoot, importDir, true);
-      return c.json({ status: 'ok', filename: filename, imported: result.summary.imported });
+      const { listTags } = await import('../lib/tagger.js');
+      return c.json({ status: 'ok', tags: listTags(true) });
     } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
   });
 
-  /* Add external image URL (no download) */
-  app.post('/api/gallery/add-external', async (c) => {
+  app.post('/api/gallery/tag/add', async (c) => {
     try {
       const body = await c.req.json();
-      const url = body.url; const tags = body.tags || [];
-      if (!url) return c.json({ status: 'error', error: 'missing url' }, 400);
-      const { initDb, runSql, flush, closeDb, getDb } = await import('../lib/db.js');
-      if (getDb()) closeDb(ctx);
+      const { initDb } = await import('../lib/db.js');
       await initDb(ctx);
-      const { randomUUID } = await import('crypto');
-      const id = randomUUID();
-      const now = new Date().toISOString();
-      const filename = url.split('/').pop() || 'external.jpg';
-      const ext = filename.includes('.') ? filename.split('.').pop() : 'jpg';
-      runSql(`INSERT INTO images (id, file_hash, path, filename, ext, size_bytes, date_imported, date_modified, hidden, source_path)
-        VALUES (?, ?, ?, ?, ?, 0, ?, ?, 0, NULL)`, [id, 'ext_' + id, 'ext:' + url, filename, ext, now, now]);
-      // 添加标签
-      if (tags.length) {
-        const { addTags } = await import('../lib/tagger.js');
-        addTags([id], Array.isArray(tags) ? tags : [tags]);
-      }
-      flush();
-      return c.json({ status: 'ok', id: id, filename: filename });
-    } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
-  });
-
-  /* ── Delete image ── */
-  app.post('/api/gallery/delete', async (c) => {
-    try {
-      const body = await c.req.json();
-      const id = body.id;
-      if (!id) return c.json({ status: 'error', error: 'missing id' }, 400);
-      const galleryRoot = ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
-      const { initDb, runSql, flush, queryOne } = await import('../lib/db.js');
-      await initDb(ctx);
-      const img = queryOne('SELECT path, thumbnail_path FROM images WHERE id = ?', [id]);
-      if (!img) return c.json({ status: 'error', error: 'image not found' }, 404);
-      // 1. 删除缩略图（galleryRoot/thumbs/xxx.jpg）
-      if (img.thumbnail_path) {
-        const thumbPath = path.resolve(galleryRoot, img.thumbnail_path);
-        try { fs.unlinkSync(thumbPath); } catch (_) {}
-      }
-      // 2. 从 image_tags 中移除标签
-      runSql('DELETE FROM image_tags WHERE image_id = ?', [id]);
-      // 3. 从 images 表中删除（纯索引模式不删源文件）
-      runSql('DELETE FROM images WHERE id = ?', [id]);
-      flush();
+      const { addTag } = await import('../lib/tagger.js');
+      addTag(body.imageId, body.tag);
       return c.json({ status: 'ok' });
+    } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
+  });
+
+  app.post('/api/gallery/tag/remove', async (c) => {
+    try {
+      const body = await c.req.json();
+      const { initDb } = await import('../lib/db.js');
+      await initDb(ctx);
+      const { removeTag } = await import('../lib/tagger.js');
+      removeTag(body.imageId, body.tag);
+      return c.json({ status: 'ok' });
+    } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
+  });
+
+  /* ── Sync ── */
+  app.post('/api/gallery/sync', async (c) => {
+    try {
+      const galleryRoot = ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery');
+      const blogImagesPath = ctx.config?.['gallery.blogImagesPath'] || 'public/images/gallery';
+      const dest = path.resolve(galleryRoot, blogImagesPath);
+      const { initDb, queryAll } = await import('../lib/db.js');
+      await initDb(ctx);
+      const images = queryAll('SELECT id, path FROM images');
+      let synced = 0;
+      for (const img of images) {
+        const src = img.path;
+        if (!fs.existsSync(src)) continue;
+        const destPath = path.join(dest, path.basename(src));
+        if (!fs.existsSync(destPath)) {
+          try { fs.mkdirSync(path.dirname(destPath), { recursive: true }); fs.copyFileSync(src, destPath); synced++; } catch(_) {}
+        }
+      }
+      return c.json({ status: 'ok', synced });
+    } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
+  });
+
+  /* ── Export ── */
+  app.get('/api/gallery/export', async (c) => {
+    try {
+      const format = c.req.query('format') || 'json';
+      const { initDb, queryAll } = await import('../lib/db.js');
+      await initDb(ctx);
+      const images = queryAll('SELECT * FROM images');
+      if (format === 'sqlite') {
+        return c.json({ status: 'ok', message: 'Use tool export instead' });
+      }
+      return c.json({ status: 'ok', count: images.length, images });
+    } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
+  });
+
+  /* ── Ping ── */
+  app.get('/api/gallery/ping', async (c) => {
+    return c.json({ status: 'ok', message: 'pong', time: Date.now() });
+  });
+
+  /* ── Thumbnail ── */
+  app.get('/api/gallery/thumb/:id', async (c) => {
+    try {
+      const id = c.req.param('id');
+      const { initDb, queryOne } = await import('../lib/db.js');
+      await initDb(ctx);
+      let img = queryOne('SELECT thumbnail_path, path FROM images WHERE id = ?', [id]);
+
+      // 检查 gen_ 前缀（image-gen generated）
+      if (!img && id.startsWith('gen_')) {
+        const filename = id.substring(4);
+        const os = await import('os');
+        const hanakoHome = process.env.HANAKO_DATA_DIR || path.join(os.homedir(), '.hanako');
+        const genDir = path.join(hanakoHome, 'plugin-data', 'image-gen', 'generated');
+        const fp = path.join(genDir, filename);
+        if (fs.existsSync(fp)) {
+          img = { path: fp, thumbnail_path: null };
+        }
+      }
+
+      if (!img) return c.json({ error: 'not found' }, 404);
+      const filePath = img.thumbnail_path ? path.resolve(ctx.config?.['gallery.galleryRoot'] || path.join(process.cwd(), 'gallery'), img.thumbnail_path) : img.path;
+      if (!fs.existsSync(filePath)) return c.json({ error: 'file not found' }, 404);
+      const ext = path.extname(filePath).toLowerCase();
+      const mimeTypes = { '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg', '.png': 'image/png', '.gif': 'image/gif', '.webp': 'image/webp', '.bmp': 'image/bmp', '.mp4': 'video/mp4', '.webm': 'video/webm' };
+      const mime = mimeTypes[ext] || 'application/octet-stream';
+      const data = fs.readFileSync(filePath);
+      return new Response(new Uint8Array(data), { headers: { 'Content-Type': mime, 'Cache-Control': 'public, max-age=3600' } });
     } catch (e) { return c.json({ status: 'error', error: e.message }, 500); }
   });
 }

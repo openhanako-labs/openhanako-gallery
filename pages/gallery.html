@@ -134,6 +134,9 @@ html,body{height:100vh;overflow:hidden;background:#ece5d8;color:#3d3d3d;font-siz
     <span class="zoom-grid-label">🔍</span>
     <input type="range" class="zoom-grid" id="gridZoom" min="120" max="350" value="180" oninput="changeGridSize()">
     <button class="icon-btn" onclick="toggleMasonry()" id="masonryBtn" title="瀑布流">⊞</button>
+    <button class="icon-btn" id="aiToggle" onclick="toggleAi()" title="AI生成" style="font-size:12px;opacity:.5">🤖</button>
+    <button class="icon-btn" id="vidToggle" onclick="toggleVid()" title="视频" style="font-size:12px;opacity:.5">🎬</button>
+    <button class="icon-btn" id="timelineToggle" onclick="toggleTimeline()" title="时间轴" style="font-size:12px;opacity:.5">📅</button>
     <button class="icon-btn" onclick="openSettings()" title="设置">⚙️</button>
   </div>
   <div class="tagbar" id="tagbar">
@@ -252,6 +255,10 @@ function esc(s){return String(s).replace(/&/g,"&amp;").replace(/</g,"&lt;").repl
 function api(path) { return '/api/plugins/hanako-gallery' + path + (t ? (path.indexOf('?')>=0?'&':'?') + 'token=' + encodeURIComponent(t) : ''); }
 
 var allImages = [], allTags = [], currentTag = '', currentKeyword = '', scanPaths = [];
+var showGenerated = true, showVideo = false, timelineMode = false;
+function toggleAi(){showGenerated=!showGenerated;document.getElementById('aiToggle').style.opacity=showGenerated?'1':'.5';_page=1;load();}
+function toggleVid(){showVideo=!showVideo;document.getElementById('vidToggle').style.opacity=showVideo?'1':'.5';_page=1;load();}
+function toggleTimeline(){timelineMode=!timelineMode;var btn=document.createElement('button');btn=document.getElementById('timelineToggle')||btn;if(document.getElementById('timelineToggle'))document.getElementById('timelineToggle').style.opacity=timelineMode?'1':'.5';_page=1;load();}
 
 function debouncedSearch() {
   clearTimeout(window._st);
@@ -264,6 +271,8 @@ async function load() {
     var q = 'pageSize=50&page='+_page;
     if (currentKeyword) q += '&keyword='+encodeURIComponent(currentKeyword);
     if (currentTag) q += '&tag='+encodeURIComponent(currentTag);
+    q += '&showGenerated=' + (showGenerated ? 'true' : 'false');
+    q += '&showVideo=' + (showVideo ? 'true' : 'false');
     var r = await fetch(api('/api/gallery/search?'+q));
     var d = await r.json();
     allImages = d.results || [];
@@ -299,14 +308,38 @@ function render() {
   if (currentTag) f = f.filter(function(i){ return i.tags && i.tags.indexOf(currentTag) >= 0; });
   if (currentKeyword) f = f.filter(function(i){ return (i.filename||'').toLowerCase().indexOf(currentKeyword) >= 0 || (i.path||'').toLowerCase().indexOf(currentKeyword) >= 0; });
   stats.textContent = _page+"/"+_pages+"p "+f.length+"/"+_total; loading.style.display = 'none';
+  if (timelineMode) { renderTimeline(f, grid); return; }
   if (f.length === 0) { grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:60px 0;color:#9a8a7a">没有找到图片</div>'; return; }
   grid.innerHTML = f.map(function(i){
     var url = api('/api/gallery/image/' + i.id);
     var tags = (i.tags||[]).map(function(t){ return '<span class="t" onclick="event.stopPropagation();removeTagFromImage(\''+i.id+'\',\''+t.replace(/'/g,"\\'")+'\')">'+t+' ××</span>'; }).join('');
     var date = (i.date_taken||i.date_imported||'').split('T')[0] || '';
     var h = masonryMode ? (150 + Math.floor(Math.random()*80)) : 150;
-    return '<div class="card" onclick="showDetail(\''+i.id+'\',\''+ i.filename.replace(/'/g,"\\'") +'\',\''+date+'\','+(i.size_bytes||0)+','+(i.width||0)+','+(i.height||0)+')"><img src="'+url+'" alt="'+i.filename+'" loading="lazy" style="height:'+h+'px"><div class="meta"><div class="name">'+i.filename+'</div>'+(date?'<div class="date">'+date+'</div>':'')+(tags?'<div class="tags">'+tags+'</div>':'')+'</div></div>';
+    return '<div class="card" onclick="showDetail(\''+i.id+'\',\''+ i.filename.replace(/'/g,"\\'") +'\',\''+date+'\','+(i.size_bytes||0)+','+(i.width||0)+','+(i.height||0)+')"><img src="'+url+'" alt="'+i.filename+'" loading="lazy" style="height:'+h+'px"><div class="meta"><div class="name">'+(i.media_type==='video'?'🎬 ':'')+i.filename+(i.source==='generated'?' [AI]':'')+'</div>'+(date?'<div class="date">'+date+'</div>':'')+(tags?'<div class="tags">'+tags+'</div>':'')+'</div></div>';
   }).join('');
+}
+
+function renderTimeline(items, grid) {
+  var groups = {};
+  items.forEach(function(i) {
+    var d = (i.date_taken||i.date_imported||'').split('T')[0] || '未知日期';
+    if (!groups[d]) groups[d] = [];
+    groups[d].push(i);
+  });
+  var dates = Object.keys(groups).sort().reverse();
+  var html = '';
+  dates.forEach(function(d) {
+    html += '<div style="margin-bottom:24px"><div style="font-size:14px;font-weight:600;color:#5a4a3a;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #d8d0c4">' + d + ' <span style="font-size:11px;color:#8a7a6a;font-weight:400">(' + groups[d].length + ')</span></div><div class="grid">';
+    groups[d].forEach(function(i) {
+      var url = api('/api/gallery/image/' + i.id);
+      var badge = i.media_type === 'video' ? '\uD83C\uDFAC ' : '';
+      var aiTag = i.source === 'generated' ? ' [AI]' : '';
+      var fn = i.filename.replace(/'/g, "\\'");
+      html += '<div class="card" onclick="showDetail(\''+i.id+'\',\''+fn+'\',\''+(i.date_taken||i.date_imported||'').split('T')[0]+'\','+(i.size_bytes||0)+','+(i.width||0)+','+(i.height||0)+')"><img src="'+url+'" alt="'+i.filename+'" loading="lazy" style="height:150px"><div class="meta"><div class="name">'+badge+i.filename+aiTag+'</div></div></div>';
+    });
+    html += '</div></div>';
+  });
+  grid.innerHTML = html;
 }
 
 function showDetail(id, name, date, size, w, h) {
@@ -480,12 +513,12 @@ function showMsg(text, type) {
 }
 
 async function saveConfig() {
-  const cleanPaths = scanPaths.filter(function(p){ return p.trim(); });
+  const cleanPaths = scanPaths.filter(function(p){ return p && typeof p==="string"; }).map(function(p){ return p.trim(); });
   try {
     var r = await fetch(api('/api/gallery/config'), {
       method: 'POST',
       headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({ scanPaths: cleanPaths, _oldPaths: window._savedPaths || cleanPaths })
+      body: JSON.stringify({ scanPaths: cleanPaths, _oldPaths: window._savedPaths || cleanPaths, galleryRoot: document.getElementById('cfgGalleryRoot').value, blogImagesPath: document.getElementById('cfgBlogPath').value, thumbnailSize: parseInt(document.getElementById('cfgThumbSize').value)||300 })
     });
     var d = await r.json();
     if (d.status === 'ok') {
@@ -501,7 +534,7 @@ async function triggerRebuild() { showMsg("正在重建（需确认）","info");
 
 async function triggerImport() {
   // 过滤空路径，只传有效目录
-  const cleanPaths = scanPaths.filter(function(p){ return p.trim(); });
+  const cleanPaths = scanPaths.filter(function(p){ return p && typeof p==="string" && p.trim(); });
   showMsg('正在导入...', 'info');
   try {
     var r = await fetch(api('/api/gallery/import'), {
