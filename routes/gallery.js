@@ -74,43 +74,42 @@ export default function (app, ctx) {
         });
       });
 
-      // ── 2. 扫描 session-files 目录（AI 生成） ──
+      // ── 2. 扫描 image-gen 生成目录（AI 生成） ──
       let totalGen = 0;
       if (showGenerated) {
-        const sessionDir = path.resolve('C:/Users/Administrator', '.hanako', 'session-files');
-        if (fs.existsSync(sessionDir)) {
+        // 从 hanako 数据目录读取 image-gen 路径，不硬编码
+        const os = await import('os');
+        const hanakoHome = process.env.HANAKO_DATA_DIR || path.join(os.homedir(), '.hanako');
+        const genDir = path.join(hanakoHome, 'plugin-data', 'image-gen', 'generated');
+        if (fs.existsSync(genDir)) {
           const genItems = [];
-          const sessionFolders = fs.readdirSync(sessionDir);
-          for (const sf of sessionFolders) {
-            const sfPath = path.join(sessionDir, sf);
-            try { if (!fs.statSync(sfPath).isDirectory()) continue; } catch(_) { continue; }
-            const files = fs.readdirSync(sfPath);
-            for (const f of files) {
-              const ext = path.extname(f).toLowerCase();
-              const isImg = ['.png','.jpg','.jpeg','.webp','.gif'].includes(ext);
-              const isVid = ['.mp4','.webm','.mov','.avi','.mkv'].includes(ext);
-              if (!isImg && !isVid) continue;
-              if (!showVideo && isVid) continue;
-              if (keyword && !f.toLowerCase().includes(keyword.toLowerCase())) continue;
-              const fp = path.join(sfPath, f);
-              try {
-                const stat = fs.statSync(fp);
-                genItems.push({
-                  id: 'gen_' + sf + '_' + f,
-                  path: fp,
-                  filename: f,
-                  ext: ext.replace('.',''),
-                  size_bytes: stat.size,
-                  width: 0, height: 0,
-                  date_taken: stat.mtime.toISOString(),
-                  date_imported: stat.mtime.toISOString(),
-                  source: 'generated',
-                  media_type: isVid ? 'video' : 'image',
-                  tags: [], prompt: null, model_id: null,
-                  favorited: 0
-                });
-              } catch(_) {}
-            }
+          const files = fs.readdirSync(genDir);
+          for (const f of files) {
+            const fp = path.join(genDir, f);
+            try { if (!fs.statSync(fp).isFile()) continue; } catch(_) { continue; }
+            const ext = path.extname(f).toLowerCase();
+            const isImg = ['.png','.jpg','.jpeg','.webp','.gif'].includes(ext);
+            const isVid = ['.mp4','.webm','.mov','.avi','.mkv'].includes(ext);
+            if (!isImg && !isVid) continue;
+            if (!showVideo && isVid) continue;
+            if (keyword && !f.toLowerCase().includes(keyword.toLowerCase())) continue;
+            try {
+              const stat = fs.statSync(fp);
+              genItems.push({
+                id: 'gen_' + f,
+                path: fp,
+                filename: f,
+                ext: ext.replace('.',''),
+                size_bytes: stat.size,
+                width: 0, height: 0,
+                date_taken: stat.mtime.toISOString(),
+                date_imported: stat.mtime.toISOString(),
+                source: 'generated',
+                media_type: isVid ? 'video' : 'image',
+                tags: [], prompt: null, model_id: null,
+                favorited: 0
+              });
+            } catch(_) {}
           }
           genItems.sort((a,b) => new Date(b.date_taken) - new Date(a.date_taken));
           totalGen = genItems.length;
@@ -162,20 +161,16 @@ export default function (app, ctx) {
       let img = queryOne('SELECT path FROM images WHERE id = ?', [id]);
       let source = 'import';
 
-      // 没找到，检查是否是 gen_ 开头（session-files）
+      // 没找到，检查是否是 gen_ 开头（image-gen generated）
       if (!img && id.startsWith('gen_')) {
-        // gen_{sessionId}_{filename} → 还原路径
-        const rest = id.substring(4); // 去掉 gen_
-        const parts = rest.split('_');
-        if (parts.length >= 2) {
-          const sessionId = parts[0];
-          const filename = parts.slice(1).join('_');
-          const sessionDir = path.resolve('C:/Users/Administrator', '.hanako', 'session-files');
-          const fp = path.join(sessionDir, sessionId, filename);
-          if (fs.existsSync(fp)) {
-            img = { path: fp };
-            source = 'generated';
-          }
+        const filename = id.substring(4); // 去掉 gen_
+        const os = await import('os');
+        const hanakoHome = process.env.HANAKO_DATA_DIR || path.join(os.homedir(), '.hanako');
+        const genDir = path.join(hanakoHome, 'plugin-data', 'image-gen', 'generated');
+        const fp = path.join(genDir, filename);
+        if (fs.existsSync(fp)) {
+          img = { path: fp };
+          source = 'generated';
         }
       }
 
@@ -396,18 +391,15 @@ export default function (app, ctx) {
       await initDb(ctx);
       let img = queryOne('SELECT thumbnail_path, path FROM images WHERE id = ?', [id]);
 
-      // 检查 gen_ 前缀
+      // 检查 gen_ 前缀（image-gen generated）
       if (!img && id.startsWith('gen_')) {
-        const rest = id.substring(4);
-        const parts = rest.split('_');
-        if (parts.length >= 2) {
-          const sessionId = parts[0];
-          const filename = parts.slice(1).join('_');
-          const sessionDir = path.resolve('C:/Users/Administrator', '.hanako', 'session-files');
-          const fp = path.join(sessionDir, sessionId, filename);
-          if (fs.existsSync(fp)) {
-            img = { path: fp, thumbnail_path: null };
-          }
+        const filename = id.substring(4);
+        const os = await import('os');
+        const hanakoHome = process.env.HANAKO_DATA_DIR || path.join(os.homedir(), '.hanako');
+        const genDir = path.join(hanakoHome, 'plugin-data', 'image-gen', 'generated');
+        const fp = path.join(genDir, filename);
+        if (fs.existsSync(fp)) {
+          img = { path: fp, thumbnail_path: null };
         }
       }
 
