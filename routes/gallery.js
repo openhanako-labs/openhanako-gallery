@@ -8,7 +8,9 @@ export default function (app, ctx) {
   let _SQL_module = null;
 
   app.get('/gallery', async (c) => {
-    const html = fs.readFileSync(path.join(pluginDir, 'pages', 'gallery.html'), 'utf-8');
+    const theme = c.req.query('hana-theme') || 'dark';
+    let html = fs.readFileSync(path.join(pluginDir, 'pages', 'gallery.html'), 'utf-8');
+    html = html.replace('<body', '<body data-hana-theme="' + String(theme).replace(/"/g, '&quot;') + '"');
     return c.html(html);
   });
 
