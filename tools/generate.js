@@ -145,7 +145,7 @@ async function execute(input, ctx) {
         </div>`;
     }
 
-    const html = `<!DOCTYPE html>
+    const pageHtml = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -211,7 +211,7 @@ document.addEventListener('keydown', function(e) {
 </html>`;
 
     // 写入文件
-    fs.writeFileSync(outputPath, html, 'utf-8');
+    fs.writeFileSync(outputPath, pageHtml, 'utf-8');
 
     return JSON.stringify({
       status: 'ok',
