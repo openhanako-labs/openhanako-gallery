@@ -1,109 +1,80 @@
 /**
- * hanako-gallery 插件生命周期入口
+ * hanako-gallery — v2 应用入口。
  *
- * onload：启动时预热图库目录和数据库。
- * onunload：卸载时刷新数据库缓存。
- * 延迟任务：注册防抖写入的周期性 flush。
+ * 架构：
+ *
+ *   ┌─ AppHost（宿主进程，Node 权限模型内）───────────────────────┐
+ *   │  · ctx.tools.register()   图库工具                          │
+ *   │  · ctx.routes.register()  卡片要调的后端路由                 │
+ *   │  · 把要干活的请求转发给下面的服务                            │
+ *   │  ✗ 读不到 app-data 之外的文件   ✗ 无出站网络                 │
+ *   └────────────────────┬───────────────────────────────────────┘
+ *                        │ ctx.runtime.fetch(runtimeId, ...)
+ *   ┌────────────────────▼───────────────────────────────────────┐
+ *   │  受管 native 服务（runtime/service.mjs，独立进程）           │
+ *   │  · 扫描用户图片目录、读 EXIF、生成缩略图、读取图片字节        │
+ *   │  · node:sqlite 索引库 + FTS5 全文检索（存 app-data）         │
+ *   └────────────────────────────────────────────────────────────┘
+ *
+ * 为什么必须拆两个进程：图库的意义就是读用户的图片目录，而 AppHost
+ * 读不到 app-data 之外的文件。native profile 才能读当前用户可读的文件。
  */
 
-import fs from 'node:fs';
-import path from 'node:path';
+import fs from "node:fs";
+import path from "node:path";
 
-const DEFAULT_GALLERY_ROOT = 'D:/Pictures/gallery';
+import { APP_ID, runtimeDataDir } from "./lib/env.mjs";
+import { registerTools } from "./lib/register-tools.mjs";
+import { registerRoutes } from "./lib/register-routes.mjs";
+import { startService, stopService } from "./lib/runtime-host.mjs";
 
-export default class HanakoGalleryPlugin {
-  async onload() {
-    const { log, pluginDir, config } = this.ctx;
-    log.info('hanako-gallery plugin loaded');
+export const name = APP_ID;
 
-    const galleryRoot = config?.['gallery.galleryRoot'] || DEFAULT_GALLERY_ROOT;
+export async function apply(ctx) {
+  // 数据目录必须最先钉死：lib/env.mjs 与受管服务都按它解析路径。
+  if (ctx.dataDir) process.env.HANAKO_PLUGIN_DATA = ctx.dataDir;
+  const log = ctx.logger;
+  const dataDir = runtimeDataDir();
 
-    // 1. 清理旧模块状态（热重载后 ESM 缓存不刷新，需要主动重置）
-    this._resetModule(log);
+  try { fs.mkdirSync(dataDir, { recursive: true }); } catch { /* ignore */ }
+  log.info(`${APP_ID} loaded`, { dataDir });
 
-    // 2. 目录结构预热
-    ensureDirectories(galleryRoot, log);
+  const disposers = [];
 
-    // 3. 数据库预热（异步，不阻塞生命周期）
-    this._warmDb(galleryRoot, log);
+  // ── 1. 工具与路由先上线 ──
+  // 它们不依赖服务；服务慢一点起来也不该让整个应用 failed。
+  try {
+    const off = await registerTools(ctx);
+    if (typeof off === "function") disposers.push(off);
+  } catch (e) {
+    log.error("工具注册失败", { error: e?.message || String(e) });
+  }
 
-    // 4. 注册定时 flush（每 30 秒，确保防抖写入的数据不会丢太久）
-    this._flushTimer = setInterval(() => this._flushDb(log), 30000);
+  try {
+    const off = await registerRoutes(ctx);
+    if (typeof off === "function") disposers.push(off);
+  } catch (e) {
+    log.error("路由注册失败", { error: e?.message || String(e) });
+  }
 
-    // 5. 注册卸载清理
-    this.register(() => {
-      this._cleanup(log);
+  // ── 2. 起受管服务 ──
+  // 首次装载存在「权限记账尚未落盘」的窗口，启动可能被拒；runtime-host 会在
+  // 第一次真调用时自愈重试，所以这里失败不当作终态。
+  const ready = await startService(ctx, { dataDir, log });
+  if (ready) {
+    log.info(`${APP_ID} ready`);
+  } else {
+    log.warn(`${APP_ID} 已加载，图库服务暂不可用 —— 首次调用时会自动重试`, {
+      hint: "需要 app/runtime.execute + app/runtime.native 授权（设置 → 安全 → 应用能力）。",
     });
   }
 
-  /** 异步预热数据库 */
-  async _warmDb(galleryRoot, log) {
-    try {
-      const { initDb, flush } = await import('./lib/db.js');
-      // 构造一个最小 ctx 供 initDb 初始化用
-      const ctx = {
-        config: {
-          'gallery.galleryRoot': galleryRoot,
-          'gallery.autoClassify': true
-        }
-      };
-      await initDb(ctx);
-      log.info('hanako-gallery: 数据库预热完成');
-    } catch (e) {
-      log.info('hanako-gallery: 数据库预热延迟（工具首次调用时初始化）');
+  return () => {
+    for (const off of disposers) {
+      try { off(); } catch { /* teardown */ }
     }
-  }
-
-  /** 周期 flush */
-  async _flushDb(log) {
-    try {
-      const { flush } = await import('./lib/db.js');
-      flush();
-    } catch (e) {
-      // 数据库未初始化，忽略
-    }
-  }
-
-  /** 卸载清理 */
-  _cleanup(log) {
-    if (this._flushTimer) {
-      clearInterval(this._flushTimer);
-      this._flushTimer = null;
-    }
-    // 最终 flush 并关闭数据库，同时清空模块级变量（_db, _SQL, _ctx, _dirty）
-    import('./lib/db.js').then(({ closeDb }) => closeDb()).catch(() => {});
-    log.info('hanako-gallery: 已清理');
-  }
-
-  /** 预热前确保模块级状态已重置（应对插件热重载后 ESM 缓存不刷新） */
-  async _resetModule(log) {
-    try {
-      const mod = await import('./lib/db.js');
-      if (mod.closeDb) mod.closeDb();
-    } catch (e) {
-      // 数据库尚未初始化，忽略
-    }
-  }
+    stopService().catch(() => {});
+  };
 }
 
-/**
- * 确保图库目录结构存在
- */
-function ensureDirectories(galleryRoot, log) {
-  const dirs = [
-    galleryRoot,
-    path.join(galleryRoot, '_uncategorized'),
-    path.join(galleryRoot, '_thumbnails')
-  ];
-
-  for (const dir of dirs) {
-    if (!fs.existsSync(dir)) {
-      try {
-        fs.mkdirSync(dir, { recursive: true });
-        log.info(`hanako-gallery: 已创建目录 ${dir}`);
-      } catch (e) {
-        log.warn(`hanako-gallery: 创建目录失败 ${dir}`, e.message);
-      }
-    }
-  }
-}
+export default { name, apply };
