@@ -1,0 +1,136 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 720" width="600" height="720">
+  <!-- 图库封面：3x3 相册网格。小尺寸下网格结构仍清晰；中心卡突出为焦点。
+       与 icon 同源暖色系，埋冷色（水波/月芽）做对比。 -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f9f5ed"/>
+      <stop offset="1" stop-color="#e2d7c3"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.47" r="0.52">
+      <stop offset="0" stop-color="#f3ddbc" stop-opacity="0.9"/>
+      <stop offset="0.55" stop-color="#ecd2ac" stop-opacity="0.32"/>
+      <stop offset="1" stop-color="#ecd2ac" stop-opacity="0"/>
+    </radialGradient>
+    <linearGradient id="sunset" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="#f4cba2"/>
+      <stop offset="1" stop-color="#df9c80"/>
+    </linearGradient>
+    <clipPath id="cc"><rect width="140" height="140" rx="16"/></clipPath>
+    <clipPath id="cc2"><rect width="156" height="156" rx="18"/></clipPath>
+    <filter id="sh" x="-25%" y="-25%" width="150%" height="150%">
+      <feDropShadow dx="0" dy="4" stdDeviation="7" flood-color="#8a7859" flood-opacity="0.22"/>
+    </filter>
+    <filter id="sh2" x="-30%" y="-30%" width="160%" height="160%">
+      <feDropShadow dx="0" dy="12" stdDeviation="18" flood-color="#8a7859" flood-opacity="0.36"/>
+    </filter>
+  </defs>
+
+  <rect width="600" height="720" fill="url(#bg)"/>
+  <rect width="600" height="720" fill="url(#glow)"/>
+
+  <g transform="rotate(-1.2 300 342)">
+
+    <!-- 卡1 山峦 -->
+    <g transform="translate(66 108)" filter="url(#sh)">
+      <g clip-path="url(#cc)">
+        <rect width="140" height="140" fill="#dce7ea"/>
+        <circle cx="46" cy="44" r="13" fill="#e8c46a"/>
+        <path d="M0 140 L52 78 L80 106 L104 82 L140 140 Z" fill="#a6bda1"/>
+        <path d="M0 140 L44 92 L70 118 L96 96 L140 140 Z" fill="#7d9a7b"/>
+      </g>
+    </g>
+
+    <!-- 卡2 日落 -->
+    <g transform="translate(230 108)" filter="url(#sh)">
+      <g clip-path="url(#cc)">
+        <rect width="140" height="140" fill="url(#sunset)"/>
+        <circle cx="70" cy="76" r="34" fill="#fdf0d8" opacity="0.88"/>
+        <rect y="94" width="140" height="46" fill="#c98f7a" opacity="0.5"/>
+        <rect y="93" width="140" height="2.5" fill="#fff" opacity="0.5"/>
+      </g>
+    </g>
+
+    <!-- 卡3 水波（冷色对比点） -->
+    <g transform="translate(394 108)" filter="url(#sh)">
+      <g clip-path="url(#cc)">
+        <rect width="140" height="140" fill="#dbe7ec"/>
+        <circle cx="106" cy="34" r="10" fill="#f0dca8" opacity="0.85"/>
+        <path d="M-4 54 Q32 40 70 54 T146 54" fill="none" stroke="#87a6b6" stroke-width="4"/>
+        <path d="M-4 80 Q32 66 70 80 T146 80" fill="none" stroke="#87a6b6" stroke-width="4" opacity="0.72"/>
+        <path d="M-4 106 Q32 92 70 106 T146 106" fill="none" stroke="#87a6b6" stroke-width="4" opacity="0.45"/>
+      </g>
+    </g>
+
+    <!-- 卡4 松林 -->
+    <g transform="translate(66 272)" filter="url(#sh)">
+      <g clip-path="url(#cc)">
+        <rect width="140" height="140" fill="#e7e0d0"/>
+        <path d="M36 24 L12 106 L60 106 Z" fill="#93a884"/>
+        <path d="M70 14 L44 106 L96 106 Z" fill="#7a9268"/>
+        <path d="M104 30 L82 106 L126 106 Z" fill="#9aae8c"/>
+        <rect y="104" width="140" height="36" fill="#d6cdb9"/>
+      </g>
+    </g>
+
+    <!-- 卡6 同心圆 -->
+    <g transform="translate(394 272)" filter="url(#sh)">
+      <g clip-path="url(#cc)">
+        <rect width="140" height="140" fill="#efe6d6"/>
+        <circle cx="70" cy="70" r="54" fill="none" stroke="#cf9f86" stroke-width="5" opacity="0.42"/>
+        <circle cx="70" cy="70" r="38" fill="none" stroke="#c48f74" stroke-width="5" opacity="0.62"/>
+        <circle cx="70" cy="70" r="22" fill="#bd7f64"/>
+      </g>
+    </g>
+
+    <!-- 卡7 点阵 -->
+    <g transform="translate(66 436)" filter="url(#sh)">
+      <g clip-path="url(#cc)">
+        <rect width="140" height="140" fill="#efe8da"/>
+        <g fill="#a8916c">
+          <circle cx="34" cy="34" r="7"/><circle cx="70" cy="34" r="7"/><circle cx="106" cy="34" r="7"/>
+          <circle cx="34" cy="70" r="7"/><circle cx="70" cy="70" r="10"/><circle cx="106" cy="70" r="7"/>
+          <circle cx="34" cy="106" r="7"/><circle cx="70" cy="106" r="7"/><circle cx="106" cy="106" r="7"/>
+        </g>
+      </g>
+    </g>
+
+    <!-- 卡8 雪峰 -->
+    <g transform="translate(230 436)" filter="url(#sh)">
+      <g clip-path="url(#cc)">
+        <rect width="140" height="140" fill="#dde6e4"/>
+        <path d="M0 140 L44 62 L78 108 L140 140 Z" fill="#8aa29d"/>
+        <path d="M0 140 L30 88 L58 124 L84 96 L140 140 Z" fill="#6d8a84"/>
+        <path d="M44 62 L35 76 L53 76 Z" fill="#f4f1ea" opacity="0.9"/>
+        <path d="M30 88 L23 100 L39 100 Z" fill="#f4f1ea" opacity="0.72"/>
+      </g>
+    </g>
+
+    <!-- 卡9 月芽（深色对比点） -->
+    <g transform="translate(394 436)" filter="url(#sh)">
+      <g clip-path="url(#cc)">
+        <rect width="140" height="140" fill="#3f4a5c"/>
+        <g fill="#e8e2d0" opacity="0.8">
+          <circle cx="30" cy="30" r="2"/><circle cx="110" cy="42" r="1.6"/>
+          <circle cx="98" cy="110" r="2"/><circle cx="32" cy="98" r="1.4"/>
+          <circle cx="116" cy="92" r="1.8"/>
+        </g>
+        <circle cx="60" cy="70" r="30" fill="#ecd9a4"/>
+        <circle cx="73" cy="63" r="28" fill="#3f4a5c"/>
+      </g>
+    </g>
+
+    <!-- 卡5 中心：拱形窗（放大突出，压在上层） -->
+    <g transform="translate(222 264)" filter="url(#sh2)">
+      <g clip-path="url(#cc2)">
+        <rect width="156" height="156" fill="#f4ead6"/>
+        <path d="M40 156 L40 78 A38 38 0 0 1 116 78 L116 156 Z" fill="#c9a86a"/>
+        <path d="M40 156 L40 78 A38 38 0 0 1 116 78 L116 156 Z" fill="none" stroke="#a98a4e" stroke-width="3"/>
+        <line x1="78" y1="40" x2="78" y2="156" stroke="#a98a4e" stroke-width="2.5"/>
+        <line x1="40" y1="94" x2="116" y2="94" stroke="#a98a4e" stroke-width="2.5"/>
+        <circle cx="78" cy="78" r="6" fill="#f4ead6"/>
+      </g>
+      <rect width="156" height="156" rx="18" fill="none" stroke="#fff" stroke-width="3" opacity="0.72"/>
+    </g>
+
+  </g>
+</svg>

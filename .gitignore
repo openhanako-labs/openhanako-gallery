@@ -1,2 +1,16 @@
+# 依赖由 build-slim.mjs 从沙盒树挑选生成，不入库。
+# 发布包里 slim 版含 exifr，nano 版完全不含 node_modules。
 node_modules/
-PROJECT_LOG.md
+
+# 构建与测试的中间产物
+*.log
+tmp*/
+.tmp*/
+out/
+dist/
+
+# 编辑器与系统杂项
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
