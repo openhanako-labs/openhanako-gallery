@@ -65,7 +65,7 @@ export async function apply(ctx) {
     log.info(`${APP_ID} ready`);
   } else {
     log.warn(`${APP_ID} 已加载，图库服务暂不可用 —— 首次调用时会自动重试`, {
-      hint: "需要 app/runtime.execute + app/runtime.native 授权（设置 → 安全 → 应用能力）。",
+      hint: "需要 app/runtime.execute + app/runtime.local-machine 授权（设置 → 安全 → 应用能力）。",
     });
   }
 

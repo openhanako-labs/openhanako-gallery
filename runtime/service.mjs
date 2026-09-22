@@ -4,8 +4,12 @@
  * 为什么图库后端必须在这里而不是在 AppHost：
  *   AppHost 及其一切子进程都跑在 Node 权限模型里，**读不到 app-data 之外的文件**。
  *   图库的全部意义恰恰是读用户的图片目录（默认取用户 Pictures 下的 gallery，可配置到任意盘）。
- *   native profile 允许「读当前用户可读的文件」，所以扫描、EXIF、缩略图、取图
- *   全在这个进程里做；AppHost 只转发。
+ *   所以扫描、EXIF、缩略图、取图全在这个进程里做；AppHost 只转发。
+ *
+ * 用什么 profile：local-machine（曾用 native，已换）。
+ *   受管进程以当前 OS 用户权限运行 —— 跟 AppHost 只差「能不能读 app-data 之外」这一件事，
+ *   而这恰好就是图库需要的全部。不需要管理员初始化，也不受 HANA_HOME 路径形态影响。
+ *   代价：这个应用没有文件系统隔离（见 lib/runtime-host.mjs 顶部的完整说明）。
  *
  * 进程内职责：
  *   · node:sqlite 索引库（存在 app-data，图片本体留在原处）
@@ -887,7 +891,14 @@ const routes = {
   /** 扫描并入库。同步实现；图片多时由 AppHost 侧轮询超时保护。 */
   "/scan": async (_req, body) => {
     const cfg = readConfig();
-    const targets = (body.paths && body.paths.length) ? body.paths : (cfg.scanPaths?.length ? cfg.scanPaths : [cfg.galleryRoot]);
+    // 显式目标可以是 paths 数组，也可以是单个 path —— 两种写法都认，
+    // 免得调用方传了 path 却被静默忽略、回退到配置根。
+    const explicit = (Array.isArray(body.paths) && body.paths.length)
+      ? body.paths
+      : (typeof body.path === "string" && body.path.trim() ? [body.path.trim()] : []);
+    const targets = explicit.length
+      ? explicit
+      : (cfg.scanPaths?.length ? cfg.scanPaths : [cfg.galleryRoot]);
     const started = Date.now();
     let imported = 0, skipped = 0, failed = 0, scanned = 0;
     const errors = [];
@@ -1373,11 +1384,12 @@ const routes = {
   /**
    * 把库里的图片复制到一个目标目录（默认博客图片目录）。
    * 只复制、不移动，已成同名文件则跳过；支持 dry_run 预演。
+   * 单向推送（push），不是双向同步 —— 路由名原为 /sync，v0.6.0 正名为 /push。
    *
    * 注：受管服务是 native profile，对当前用户可读的文件有写权限；
    * 若目标目录因平台写限制拒写，会在 errors 里如实回报。
    */
-  "/sync": async (_req, body) => {
+  "/push": async (_req, body) => {
     const cfg = readConfig();
     const dest = (typeof body.dest === "string" && body.dest.trim()) ? body.dest.trim() : cfg.blogImagesPath;
     if (!dest) return { ok: false, error: "需要 dest 参数，或在配置里设置 blogImagesPath" };

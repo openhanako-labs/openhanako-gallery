@@ -58,6 +58,10 @@
 
   var allImages = [], allTags = [], currentTag = "", currentKeyword = "", scanPaths = [];
   var showVideo = false, timelineMode = false, masonryMode = false, listMode = false;
+  // currentRatio：比例筛选。v0.6.0 从 <select> 改成 pill，用状态变量而不是读 DOM。
+  var currentRatio = "";
+  // 无任何筛选时的总数，用来给「全部」标签显示计数。
+  var _allCount = 0;
   var _page = 1, _pages = 1, _total = 0;
   var _zoom = 1, _favState = {}, _importUrl = null;
   // 来源分组：内置素材/媒体库/生成图片不入库，靠 source 参数过滤
@@ -92,8 +96,7 @@
         q += "&source=" + encodeURIComponent(currentSource);
       } else {
         if (currentTag) q += "&tag=" + encodeURIComponent(currentTag);
-        var ratio = document.getElementById("ratioFilter").value;
-        if (ratio) q += "&ratio=" + encodeURIComponent(ratio);
+        if (currentRatio) q += "&ratio=" + encodeURIComponent(currentRatio);
       }
       var sort = document.getElementById("sortSelect").value;
       if (sort) q += "&sort=" + encodeURIComponent(sort);
@@ -102,10 +105,9 @@
       if (showVideo) q += "&showVideo=true";
 
       // 比例筛选只对入库图片有意义（靠 width/height 判断）。
-      // 三个外部来源的 width/height 都是 0，切了也是白切，禁用掉。
-      var ratioEl = document.getElementById("ratioFilter");
-      ratioEl.disabled = !!currentSource;
-      ratioEl.style.opacity = currentSource ? ".4" : "1";
+      // 三个外部来源的 width/height 都是 0，切了也是白切，整组禁用。
+      var rg = document.getElementById("ratioGroup");
+      if (rg) rg.classList.toggle("is-disabled", !!currentSource);
 
       var r = await apiFetch("/search?" + q);
       var d = await r.json();
@@ -113,11 +115,15 @@
       _total = d.total || 0;
       _pages = d.pages || 1;
       _page = d.page || 1;
+      // 没有任何筛选时，total 就是全库张数 —— 给「全部」标签当计数。
+      if (!currentKeyword && !currentTag && !currentSource) _allCount = _total;
 
       var tr = await apiFetch("/tags");
       var td = await tr.json();
       allTags = td.tags || [];
-      refreshSourceCounts();
+      // 必须 await：否则第一次 renderTags 拿到的是空 sourceInfo，
+      // 三个来源标签的计数会漏掉（以前只显示「(数量)」，0 不显示，所以一直没暴露）。
+      await refreshSourceCounts();
       renderTags();
       render();
     } catch (e) {
@@ -147,7 +153,9 @@
 
   function renderTags() {
     var bar = document.getElementById("tagbar");
-    bar.innerHTML = '<span class="tag tag-all' + (currentTag === "" && currentSource === "" ? " active" : "") + '" onclick="filterAll()">全部</span>';
+    var allOn = (currentTag === "" && currentSource === "" && !currentRatio) ? " active" : "";
+    bar.innerHTML = '<span class="tag tag-all' + allOn + '" onclick="filterAll()">全部' +
+      (_allCount ? ' <b>' + _allCount + '</b>' : '') + '</span>';
     // 内置来源分组：与用户标签并排，但用不同样式区分（它们不是标签）
     SOURCE_GROUPS.forEach(function (g) {
       var info = sourceInfo[g.key] || {};
@@ -155,7 +163,7 @@
       var vids = (info.totalMedia || 0) - n;
       var el = document.createElement("span");
       el.className = "tag tag-source" + (currentSource === g.key ? " active" : "") + ((n || vids) ? " has-count" : " empty");
-      el.textContent = g.label + (n ? " (" + n + ")" : "");
+      el.innerHTML = g.label + (n ? ' <b>' + n + '</b>' : '');
       el.title = n
         ? g.label + "：图片 " + n + (vids ? "，另有视频 " + vids + " 个（点顶部 🎬 可看）" : " 个")
         : g.label + "：暂未发现媒体文件";
@@ -165,7 +173,7 @@
     allTags.forEach(function (t) {
       var el = document.createElement("span");
       el.className = "tag" + (currentTag === t.name && currentSource === "" ? " active" : "");
-      el.textContent = t.name + (t.image_count ? " (" + t.image_count + ")" : "");
+      el.innerHTML = esc(t.name) + (t.image_count ? ' <b>' + t.image_count + '</b>' : '');
       el.onclick = function () { filterTag(t.name); };
       bar.appendChild(el);
     });
@@ -173,7 +181,21 @@
 
   function filterTag(tag) { currentSource = ""; currentTag = tag; _page = 1; _modalIdx = -1; load(); }
   function filterSource(src) { currentTag = ""; currentSource = src; _page = 1; _modalIdx = -1; load(); }
-  function filterAll() { currentTag = ""; currentSource = ""; _page = 1; _modalIdx = -1; load(); }
+  // 「全部」就是全部：标签、来源、比例一起清掉。
+  function filterAll() {
+    currentTag = ""; currentSource = ""; currentRatio = "";
+    syncRatioPills();
+    _page = 1; _modalIdx = -1; load();
+  }
+
+  /** 只同步 pill 的高亮，不触发加载。 */
+  function syncRatioPills() {
+    var rg = document.getElementById("ratioGroup");
+    if (!rg) return;
+    rg.querySelectorAll(".pill").forEach(function (b) {
+      b.classList.toggle("is-on", (b.dataset.ratio || "") === currentRatio);
+    });
+  }
 
   function render() {
     var grid = document.getElementById("grid");
@@ -189,29 +211,66 @@
 
     if (timelineMode) { renderTimeline(f, grid); return; }
     if (f.length === 0) {
-      grid.innerHTML = '<div style="grid-column:1/-1;text-align:center;padding:60px 0;color:#9a8a7a">没有找到图片</div>';
+      grid.innerHTML = '<div class="empty-hint">没有找到图片</div>';
       return;
     }
 
     grid.innerHTML = f.map(function (i) {
-      var url = apiUrl("/image/" + encodeURIComponent(i.id));
-      var tags = (i.tags || []).map(function (t) {
-        return '<span class="t" onclick="event.stopPropagation();removeTagFromImage(\'' + i.id + '\',\'' + t.replace(/'/g, "\\'") + '\')">' + esc(t) + ' ××</span>';
-      }).join("");
-      var date = (i.date_taken || i.date_imported || "").split("T")[0] || "";
-      var h = masonryMode ? (150 + Math.floor(Math.random() * 80)) : 150;
-      var isVid = i.media_type === "video";
-      var media = isVid
-        ? '<video src="' + url + '" muted preload="metadata" style="height:' + h + 'px"></video>'
-        : '<img src="' + url + '" alt="' + esc(i.filename) + '" loading="lazy" style="height:' + h + 'px">';
-      var badge = isVid ? "🎬 " : "";
-      var srcTag = i.source === "external" ? " [外链]" : i.source === "builtin" ? " [内置]" : i.source === "generated" ? " [生成]" : "";
-      return '<div class="card" onclick="showDetail(\'' + i.id + '\')">' + media +
-        '<div class="meta"><div class="name">' + badge + esc(i.filename) + srcTag + '</div>' +
-        (date ? '<div class="date">' + date + '</div>' : '') +
-        (tags ? '<div class="tags">' + tags + '</div>' : '') +
-        '</div></div>';
+      return cardHtml(i, masonryMode ? { h: 150 + Math.floor(Math.random() * 80) } : null);
     }).join("");
+  }
+
+  /**
+   * 来源 → 角标。DB 内的是 import / external，三个只读来源是 generated / builtin / media-lib。
+   * ro=true 的来源用 accent 底 —— 它们是引用，不是你的图。
+   */
+  var SOURCE_BADGE = {
+    "import":    { text: "LOCAL",   ro: false },
+    "external":  { text: "外链",     ro: false },
+    "generated": { text: "生成图",   ro: true },
+    "builtin":   { text: "内置素材", ro: true },
+    "media-lib": { text: "媒体库",   ro: true }
+  };
+
+  /**
+   * 单张卡片的 HTML。
+   * opts.h 给定缩略图高度（瀑布流每张不同）；不传就跟随网格的 --thumb-h。
+   */
+  function cardHtml(i, opts) {
+    opts = opts || {};
+    var url = apiUrl("/image/" + encodeURIComponent(i.id));
+    var isVid = i.media_type === "video";
+    var src = SOURCE_BADGE[i.source] || SOURCE_BADGE["import"];
+    var ext = String(i.ext || "").toUpperCase();
+
+    var media = isVid
+      ? '<video src="' + url + '" muted preload="metadata"></video>'
+      : '<img src="' + url + '" alt="' + esc(i.filename) + '" loading="lazy">';
+
+    var badges = '<span class="badge tl' + (src.ro ? " ro" : "") + '">' + src.text + '</span>';
+    if (isVid) badges += '<span class="badge bl">▶</span>';
+    if (ext) badges += '<span class="badge br">' + esc(ext) + '</span>';
+
+    // 规格行：日期 · 尺寸 · 大小。外部来源没有宽高（0），自动跳过。
+    var bits = [];
+    var d = (i.date_taken || i.date_imported || "").split("T")[0];
+    if (d) bits.push(d);
+    if (i.width && i.height) bits.push(i.width + "×" + i.height);
+    if (i.size_bytes) bits.push((i.size_bytes / 1024 / 1024).toFixed(1) + "M");
+
+    var tags = (i.tags || []).map(function (t) {
+      return '<span class="t" title="移除标签" onclick="event.stopPropagation();removeTagFromImage(\'' + i.id + '\',\'' +
+        t.replace(/'/g, "\\'") + '\')">' + esc(t) + ' ×</span>';
+    }).join("");
+
+    return '<div class="card" onclick="showDetail(\'' + i.id + '\')"' +
+      (opts.h ? ' style="--thumb-h:' + opts.h + 'px"' : '') + '>' +
+      '<div class="thumb">' + media + badges + '</div>' +
+      '<div class="meta">' +
+        '<div class="name">' + esc(i.filename) + '</div>' +
+        (bits.length ? '<div class="date">' + esc(bits.join(" · ")) + '</div>' : '') +
+        (tags ? '<div class="tags">' + tags + '</div>' : '') +
+      '</div></div>';
   }
 
   function renderTimeline(items, grid) {
@@ -226,15 +285,7 @@
     dates.forEach(function (d) {
       html += '<div style="margin-bottom:24px"><div style="font-size:14px;font-weight:600;color:#5a4a3a;margin-bottom:8px;padding-bottom:4px;border-bottom:1px solid #d8d0c4">' + esc(d) +
         ' <span style="font-size:11px;color:#8a7a6a;font-weight:400">(' + groups[d].length + ')</span></div><div class="grid">';
-      groups[d].forEach(function (i) {
-        var url = apiUrl("/image/" + encodeURIComponent(i.id));
-        var isVid = i.media_type === "video";
-        var media = isVid
-          ? '<video src="' + url + '" muted preload="metadata" style="height:150px"></video>'
-          : '<img src="' + url + '" alt="' + esc(i.filename) + '" loading="lazy" style="height:150px">';
-        html += '<div class="card" onclick="showDetail(\'' + i.id + '\')">' + media +
-          '<div class="meta"><div class="name">' + (isVid ? "🎬 " : "") + esc(i.filename) + '</div></div></div>';
-      });
+      groups[d].forEach(function (i) { html += cardHtml(i); });
       html += "</div></div>";
     });
     grid.innerHTML = html;
@@ -646,25 +697,55 @@
   /* ── 排序 / 视图 / 分页 ───────────────────────────────── */
 
   function changeSort() { _page = 1; load(); }
+
+  /** 设比例筛选并同步 pill 高亮。来源分组模式下整组被禁用，点了直接忽略。 */
+  function setRatio(v) {
+    var rg = document.getElementById("ratioGroup");
+    if (rg && rg.classList.contains("is-disabled")) return;
+    currentRatio = v || "";
+    syncRatioPills();
+    _page = 1;
+    load();
+  }
+
+  /** v1 兼容入口：按当前状态重新加载。 */
   function applyRatioFilter() { _page = 1; load(); }
 
+  /** 搜索语法浮层：hover 自动出，点击可固定 / 收起。 */
+  function toggleSearchHelp(e) {
+    if (e) e.stopPropagation();
+    var w = document.getElementById("searchWrap");
+    if (w) w.classList.toggle("help-open");
+  }
+
+  /**
+   * 网格 / 列表切换。
+   * 缩略图高度改由 --thumb-h 驱动（网格统一、瀑布流每卡覆写、列表固定 88px），
+   * 所以这里不再直接改 <img> 的 style.height。
+   */
   function toggleView() {
     listMode = !listMode;
     document.getElementById("viewBtn").textContent = listMode ? "☰" : "▦";
     var grid = document.getElementById("grid");
+    var cards = document.querySelectorAll(".card");
+    grid.classList.toggle("list-mode", listMode);
+    cards.forEach(function (c) { c.classList.toggle("list", listMode); });
     if (listMode) {
-      grid.style.gridTemplateColumns = "1fr";
-      document.querySelectorAll(".card img, .card video").forEach(function (i) { i.style.height = "80px"; });
+      grid.style.gridTemplateColumns = "";
+      cards.forEach(function (c) { c.style.setProperty("--thumb-h", "88px"); });
     } else {
+      cards.forEach(function (c) { c.style.removeProperty("--thumb-h"); });
       changeGridSize();
-      document.querySelectorAll(".card img, .card video").forEach(function (i) { i.style.height = ""; });
     }
   }
 
+  /** 滑块同时改列宽与缩略图高度 —— 否则放大只是裁得更狠。 */
   function changeGridSize() {
     if (listMode) return;
-    var val = document.getElementById("gridZoom").value;
-    document.getElementById("grid").style.gridTemplateColumns = "repeat(auto-fill, minmax(" + val + "px, 1fr))";
+    var val = Number(document.getElementById("gridZoom").value) || 180;
+    var grid = document.getElementById("grid");
+    grid.style.gridTemplateColumns = "repeat(auto-fill, minmax(" + val + "px, 1fr))";
+    grid.style.setProperty("--thumb-h", Math.round(val * 0.83) + "px");
   }
 
   function toggleMasonry() {
@@ -694,11 +775,21 @@
 
   document.addEventListener("keydown", function (e) {
     var modalOpen = document.getElementById("modal").classList.contains("show");
-    if (e.key === "Escape") { closeModal(); closeDeleteModal(); closeSettings(); }
+    if (e.key === "Escape") {
+      closeModal(); closeDeleteModal(); closeSettings();
+      var sw = document.getElementById("searchWrap");
+      if (sw) sw.classList.remove("help-open");
+    }
     // 弹窗开着时用左右方向键切图（输入框聚焦时不接管）
     if (modalOpen && document.activeElement && /^(INPUT|TEXTAREA)$/.test(document.activeElement.tagName)) return;
     if (modalOpen && e.key === "ArrowLeft") { e.preventDefault(); modalPrev(); }
     if (modalOpen && e.key === "ArrowRight") { e.preventDefault(); modalNext(); }
+  });
+
+  // 点搜索框以外的地方收起语法浮层
+  document.addEventListener("click", function (e) {
+    var w = document.getElementById("searchWrap");
+    if (w && !w.contains(e.target)) w.classList.remove("help-open");
   });
   document.getElementById("modalImg").addEventListener("wheel", function (e) {
     e.preventDefault();
@@ -725,9 +816,11 @@
     prePage: prePage, nextPage: nextPage, showMsg: showMsg,
     modalPrev: modalPrev, modalNext: modalNext,
     filterAll: filterAll, filterSource: filterSource, refreshSourceCounts: refreshSourceCounts,
+    setRatio: setRatio, toggleSearchHelp: toggleSearchHelp,
   });
 
   /* ── 启动 ─────────────────────────────────────────────── */
 
+  changeGridSize();
   load();
 })();

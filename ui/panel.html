@@ -8,13 +8,31 @@
 </head>
 <body>
 <div class="layout">
+
+  <!-- ═══ 导航层：搜索 / 翻页 / 排序 / 视图工具 ═══ -->
   <div class="topbar">
     <h1>📷 Gallery</h1>
-    <input class="search-input" id="searchInput" placeholder="搜索图片..." oninput="debouncedSearch()">
-    <button class="icon-btn" onclick="prePage()" style="font-size:12px" title="上一页">◀</button>
-    <span class="stats" id="stats">—</span>
-    <button class="icon-btn" onclick="nextPage()" style="font-size:12px" title="下一页">▶</button>
-    <select class="sort-select" id="sortSelect" onchange="changeSort()">
+
+    <div class="search-wrap" id="searchWrap">
+      <input class="search-input" id="searchInput" placeholder="搜索图片…" oninput="debouncedSearch()">
+      <button class="search-help-btn" type="button" onclick="toggleSearchHelp(event)" title="搜索语法">?</button>
+      <div class="search-help" id="searchHelp">
+        <div class="sh-title">搜索语法</div>
+        <span class="sh-row"><code>雪山</code>文件名 / 路径包含</span>
+        <span class="sh-row"><code>tag:风景</code>按标签筛选</span>
+        <span class="sh-row"><code>ext:png</code>按格式筛选</span>
+        <span class="sh-row"><code>2026-09</code>按月份筛选</span>
+        <div class="sh-note">多个条件之间是「同时满足」。</div>
+      </div>
+    </div>
+
+    <div class="transport">
+      <button class="icon-btn" type="button" onclick="prePage()" title="上一页">◀</button>
+      <span class="stats" id="stats">—</span>
+      <button class="icon-btn" type="button" onclick="nextPage()" title="下一页">▶</button>
+    </div>
+
+    <select class="sort-select" id="sortSelect" onchange="changeSort()" title="排序">
       <option value="date_desc">日期 ↓</option>
       <option value="date_asc">日期 ↑</option>
       <option value="name_asc">名称 A-Z</option>
@@ -22,44 +40,58 @@
       <option value="size_desc">大小 ↓</option>
       <option value="size_asc">大小 ↑</option>
     </select>
-    <select class="sort-select" id="ratioFilter" onchange="applyRatioFilter()" style="max-width:70px">
-      <option value="">全部</option>
-      <option value="favorite">⭐ 收藏</option>
-      <option value="wide">宽屏</option>
-      <option value="tall">竖屏</option>
-      <option value="square">方形</option>
-    </select>
-    <button class="icon-btn" onclick="toggleView()" id="viewBtn" title="切换视图">▦</button>
-    <span class="zoom-grid-label">🔍</span>
-    <input type="range" class="zoom-grid" id="gridZoom" min="120" max="350" value="180" oninput="changeGridSize()">
-    <button class="icon-btn" onclick="toggleMasonry()" id="masonryBtn" title="瀑布流">⊞</button>
-    <button class="icon-btn" id="vidToggle" onclick="toggleVid()" title="视频" style="font-size:12px;opacity:.5">🎬</button>
-    <button class="icon-btn" id="timelineToggle" onclick="toggleTimeline()" title="时间轴" style="font-size:12px;opacity:.5">📅</button>
-    <button class="icon-btn" onclick="openSettings()" title="设置">⚙️</button>
+
+    <div class="ctrls">
+      <button class="icon-btn" type="button" onclick="toggleView()" id="viewBtn" title="切换视图：网格 / 列表">▦</button>
+      <button class="icon-btn" type="button" onclick="toggleMasonry()" id="masonryBtn" title="瀑布流">⊞</button>
+      <button class="icon-btn" type="button" id="vidToggle" onclick="toggleVid()" title="显示视频" style="opacity:.5">🎬</button>
+      <button class="icon-btn" type="button" id="timelineToggle" onclick="toggleTimeline()" title="按日期分组" style="opacity:.5">📅</button>
+      <button class="icon-btn" type="button" onclick="openSettings()" title="设置">⚙️</button>
+    </div>
   </div>
+
+  <!-- ═══ 过滤层：比例筛选 / 缩略图尺寸 ═══ -->
+  <div class="filtbar">
+    <div class="pillgroup" id="ratioGroup">
+      <button class="pill is-on" type="button" data-ratio="" onclick="setRatio('')">全部</button>
+      <button class="pill" type="button" data-ratio="favorite" onclick="setRatio('favorite')">☆ 收藏</button>
+      <button class="pill" type="button" data-ratio="wide" onclick="setRatio('wide')">宽屏</button>
+      <button class="pill" type="button" data-ratio="tall" onclick="setRatio('tall')">竖屏</button>
+      <button class="pill" type="button" data-ratio="square" onclick="setRatio('square')">方形</button>
+    </div>
+
+    <div class="zoom-wrap">
+      <span class="zoom-grid-label" title="缩略图尺寸">🔍</span>
+      <input type="range" class="zoom-grid" id="gridZoom" min="120" max="350" value="180" oninput="changeGridSize()" title="缩略图尺寸">
+    </div>
+  </div>
+
+  <!-- ═══ 标签栏（由 panel.js 渲染） ═══ -->
   <div class="tagbar" id="tagbar">
-    <span class="tag tag-all active" onclick="filterTag('')">全部</span>
+    <span class="tag tag-all active" onclick="filterAll()">全部</span>
   </div>
+
   <div class="scroll-area" id="scrollArea">
-    <div class="loading" id="loading"><div class="spin"></div>加载中...</div>
+    <div class="loading" id="loading"><div class="spin"></div>加载中…</div>
     <div class="grid" id="grid"></div>
   </div>
 </div>
 
+<!-- ═══ 预览 ═══ -->
 <div class="modal" id="modal" onclick="if(event.target===this)closeModal()">
   <span class="close" onclick="closeModal()">&times;</span>
   <div class="modal-content">
     <img id="modalImg" src="" alt="">
-    <video id="modalVideo" controls hidden style="max-width:85vw;max-height:75vh;display:block"></video>
+    <video id="modalVideo" controls hidden></video>
     <div class="zoom-bar">
-      <button class="zoom-btn nav-btn" onclick="modalPrev()" title="上一张 (←)">◀</button>
+      <button class="zoom-btn nav-btn" type="button" onclick="modalPrev()" title="上一张 (←)">◀</button>
       <span class="zoom-level" id="zoomLevel">100%</span>
-      <button class="zoom-btn nav-btn" onclick="modalNext()" title="下一张 (→)">▶</button>
+      <button class="zoom-btn nav-btn" type="button" onclick="modalNext()" title="下一张 (→)">▶</button>
       <span class="nav-count" id="navCount"></span>
-      <button class="zoom-btn" onclick="zoomImg(-0.25)">−</button>
-      <button class="zoom-btn" onclick="zoomImg(0.25)">+</button>
-      <button class="zoom-btn" onclick="resetZoom()">⊡</button>
-      <button class="zoom-btn" onclick="toggleFavorite()" id="favBtn">☆</button>
+      <button class="zoom-btn" type="button" onclick="zoomImg(-0.25)" title="缩小">−</button>
+      <button class="zoom-btn" type="button" onclick="zoomImg(0.25)" title="放大">+</button>
+      <button class="zoom-btn" type="button" onclick="resetZoom()" title="原始大小">⊡</button>
+      <button class="zoom-btn" type="button" onclick="toggleFavorite()" id="favBtn" title="收藏">☆</button>
     </div>
     <div class="modal-info">
       <div class="name" id="modalName"></div>
@@ -67,25 +99,26 @@
       <div class="detail-row"><span id="modalSize"></span><span id="modalDate"></span><span id="modalDim"></span></div>
       <div class="modal-tags" id="modalTags"></div>
       <div class="modal-actions" id="modalActions">
-        <input type="text" id="renameInput" placeholder="重命名..." class="rename-input">
-        <button class="modal-btn" onclick="renameImage()">✏️</button>
-        <button class="modal-btn" onclick="aiSuggestName()">✨ 命名</button>
-        <button class="modal-btn" onclick="deleteImage()" style="color:#c08070">删除</button>
-        <button class="modal-btn" onclick="showGroupPanel()">📁 分组</button>
+        <input type="text" id="renameInput" placeholder="重命名…" class="rename-input">
+        <button class="modal-btn" type="button" onclick="renameImage()" title="应用重命名">✏️ 改名</button>
+        <button class="modal-btn" type="button" onclick="aiSuggestName()" title="按日期+原名生成建议">✨ 命名</button>
+        <button class="modal-btn" type="button" onclick="showGroupPanel()" title="添加标签">📁 分组</button>
+        <button class="modal-btn danger" type="button" onclick="deleteImage()">删除</button>
       </div>
       <div class="group-input" id="groupInput" hidden>
         <input type="text" id="groupInputField" placeholder="输入标签，逗号分隔" class="rename-input">
-        <button class="modal-btn" onclick="addGroupTag()">➕ 添加</button>
+        <button class="modal-btn" type="button" onclick="addGroupTag()">➕ 添加</button>
       </div>
     </div>
   </div>
 </div>
 
+<!-- ═══ 设置 ═══ -->
 <div class="overlay" id="overlay" onclick="closeSettings()"></div>
 <div class="settings" id="settings">
   <div class="settings-header">
-    <h2>⚙️ 图库设置</h2>
-    <button class="close-btn" onclick="closeSettings()">&times;</button>
+    <h2>图库设置</h2>
+    <button class="close-btn" type="button" onclick="closeSettings()">&times;</button>
   </div>
   <div class="settings-body">
     <div class="status-msg" id="statusMsg"></div>
@@ -108,54 +141,54 @@
     <div class="settings-group">
       <h3>导入来源目录</h3>
       <div id="scanPathsList"></div>
-      <button class="path-add-btn" onclick="addScanPath()">+ 添加目录</button>
+      <button class="path-add-btn" type="button" onclick="addScanPath()">+ 添加目录</button>
     </div>
 
     <div class="settings-group">
       <h3>生成图来源</h3>
-      <div id="genSourcesList" style="font-size:11px;color:#8a7a6a;line-height:1.7">检测中…</div>
-      <button class="action-btn secondary" onclick="refreshGenSources()" style="margin-top:6px">🔄 重新检测</button>
+      <div id="genSourcesList" style="font-size:11px;color:#a39781;line-height:1.7">检测中…</div>
+      <button class="action-btn secondary" type="button" onclick="refreshGenSources()" style="margin-top:8px">🔄 重新检测</button>
     </div>
 
     <div class="settings-group">
       <h3>内置素材</h3>
-      <div id="builtinSourcesList" style="font-size:11px;color:#8a7a6a;line-height:1.7">检测中…</div>
+      <div id="builtinSourcesList" style="font-size:11px;color:#a39781;line-height:1.7">检测中…</div>
     </div>
 
     <div class="settings-group">
       <h3>操作</h3>
-      <button class="action-btn primary" onclick="saveConfig()">💾 保存设置</button>
-      <button class="action-btn secondary" onclick="triggerRebuild()">🔄 重建索引</button>
-      <button class="action-btn secondary" onclick="triggerImport()">📥 import</button>
+      <button class="action-btn primary" type="button" onclick="saveConfig()">💾 保存设置</button>
+      <button class="action-btn secondary" type="button" onclick="triggerRebuild()">🔄 重建索引</button>
+      <button class="action-btn secondary" type="button" onclick="triggerImport()">📥 扫描导入</button>
     </div>
 
     <div class="settings-group">
       <h3>导入链接</h3>
-      <input type="text" id="importUrlInput" placeholder="https://...jpg" style="width:100%;background:#3d352e;border:1px solid #4d443b;border-radius:8px;padding:7px 10px;font-size:13px;color:#d4cdc4;outline:none;margin-bottom:6px">
-      <div id="importPreview" style="width:100%;height:120px;background:#2a2520;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#6a5a4a;font-size:11px;margin-bottom:6px;overflow:hidden">预览</div>
-      <button class="action-btn secondary" onclick="previewImportUrl()">preview</button>
-      <button class="action-btn primary" onclick="confirmImportUrl()">导入</button>
+      <input type="text" id="importUrlInput" placeholder="https://…jpg" style="width:100%;background:#fffdf8;border:1px solid #ded2be;border-radius:6px;padding:0 10px;height:28px;font-size:12px;color:#3a322a;outline:none;margin-bottom:6px">
+      <div id="importPreview" style="width:100%;height:120px;background:#efe8db;border-radius:6px;display:flex;align-items:center;justify-content:center;color:#a39781;font-size:11px;margin-bottom:8px;overflow:hidden">预览</div>
+      <button class="action-btn secondary" type="button" onclick="previewImportUrl()">预览</button>
+      <button class="action-btn primary" type="button" onclick="confirmImportUrl()">导入</button>
     </div>
 
     <div class="settings-group">
       <h3>外部图床链接</h3>
-      <input type="text" id="extUrlInput" placeholder="https://i.imagehost.com/photo.jpg" style="width:100%;background:#3d352e;border:1px solid #4d443b;border-radius:8px;padding:7px 10px;font-size:13px;color:#d4cdc4;outline:none;margin-bottom:6px">
-      <input type="text" id="extTagsInput" placeholder="标签（逗号分隔）" style="width:100%;background:#3d352e;border:1px solid #4d443b;border-radius:8px;padding:7px 10px;font-size:13px;color:#d4cdc4;outline:none;margin-bottom:6px">
-      <button class="action-btn primary" onclick="addExternalUrl()">+ 添加外部</button>
+      <input type="text" id="extUrlInput" placeholder="https://i.imagehost.com/photo.jpg" style="width:100%;background:#fffdf8;border:1px solid #ded2be;border-radius:6px;padding:0 10px;height:28px;font-size:12px;color:#3a322a;outline:none;margin-bottom:6px">
+      <input type="text" id="extTagsInput" placeholder="标签（逗号分隔）" style="width:100%;background:#fffdf8;border:1px solid #ded2be;border-radius:6px;padding:0 10px;height:28px;font-size:12px;color:#3a322a;outline:none;margin-bottom:8px">
+      <button class="action-btn primary" type="button" onclick="addExternalUrl()">+ 添加外部</button>
     </div>
   </div>
 </div>
 
-<!-- Delete confirm modal -->
+<!-- ═══ 确认删除 ═══ -->
 <div class="modal" id="deleteModal" onclick="if(event.target===this)closeDeleteModal()">
   <div class="modal-confirm">
-    <p style="color:#ddd;font-size:14px;margin:0 0 16px">确认删除此图片？</p>
-    <label style="display:flex;align-items:center;gap:8px;color:#c4b4a0;font-size:12px;margin-bottom:16px">
+    <p>确认删除此图片？</p>
+    <label>
       <input type="checkbox" id="deleteFileToo"> 同时删除磁盘文件（不可恢复）
     </label>
-    <div style="display:flex;gap:10px;justify-content:flex-end">
-      <button class="modal-btn" onclick="closeDeleteModal()">取消</button>
-      <button class="modal-btn" style="color:#c08070" onclick="doDelete()">确认删除</button>
+    <div>
+      <button class="modal-btn" type="button" onclick="closeDeleteModal()">取消</button>
+      <button class="modal-btn danger" type="button" onclick="doDelete()">确认删除</button>
     </div>
   </div>
 </div>
