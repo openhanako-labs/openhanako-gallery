@@ -44,8 +44,9 @@
     <div class="ctrls">
       <button class="icon-btn" type="button" onclick="toggleView()" id="viewBtn" title="切换视图：网格 / 列表">▦</button>
       <button class="icon-btn" type="button" onclick="toggleMasonry()" id="masonryBtn" title="瀑布流">⊞</button>
-      <button class="icon-btn" type="button" id="vidToggle" onclick="toggleVid()" title="显示视频" style="opacity:.5">🎬</button>
+      <button class="icon-btn" type="button" id="vidToggle" onclick="toggleVid()" title="只看视频" style="opacity:.5">🎬</button>
       <button class="icon-btn" type="button" id="timelineToggle" onclick="toggleTimeline()" title="按日期分组" style="opacity:.5">📅</button>
+      <button class="icon-btn" type="button" onclick="toggleSelMode()" id="selToggle" title="多选（批量操作）" style="opacity:.5">☑</button>
       <button class="icon-btn" type="button" onclick="openSettings()" title="设置">⚙️</button>
     </div>
   </div>
@@ -64,11 +65,42 @@
       <span class="zoom-grid-label" title="缩略图尺寸">🔍</span>
       <input type="range" class="zoom-grid" id="gridZoom" min="120" max="350" value="180" oninput="changeGridSize()" title="缩略图尺寸">
     </div>
+
+    <!-- 文件夹维度：目录由 /folders 填，选项带图片数。不是「移动文件」，只是过滤。 -->
+    <button class="pill" type="button" id="semPill" onclick="toggleSemantic()" title="语义检索：按意思找，不看词面（需要先建语义索引，在设置里）">🔮 语义</button>
+
+    <select class="sort-select" id="folderSelect" onchange="filterFolder(this.value)" title="按文件夹筛选">
+      <option value="">全部文件夹</option>
+    </select>
   </div>
 
   <!-- ═══ 标签栏（由 panel.js 渲染） ═══ -->
   <div class="tagbar" id="tagbar">
     <span class="tag tag-all active" onclick="filterAll()">全部</span>
+  </div>
+
+  <!-- 批量选择条：只在多选模式下出现。 -->
+  <div class="selbar" id="selBar" hidden>
+    <span class="selbar-count" id="selCount">已选 0 张</span>
+    <button class="modal-btn" type="button" onclick="selectAllPage()">全选本页</button>
+    <button class="modal-btn" type="button" onclick="invertSelPage()">反选本页</button>
+    <input class="selbar-input" type="text" id="selTagInput" placeholder="标签名，逗号分隔"
+           onkeydown="if(event.key==='Enter'){event.preventDefault();batchTag();}">
+    <button class="modal-btn" type="button" onclick="batchTag()">🏷 批量打标</button>
+    <button class="modal-btn" type="button" onclick="batchUntag()" title="用同一个输入框里的标签名，从选中的图上一并去掉">🏷 去标签</button>
+    <button class="modal-btn" type="button" id="aiBatchBtn" onclick="batchAiDescribe()" title="用视觉模型给选中的图逐张生成描述与标签">✨ 识图打标</button>
+    <button class="modal-btn" type="button" onclick="batchReveal()">📂 打开首个所在文件夹</button>
+    <button class="modal-btn" type="button" onclick="batchRename()" id="selRenameBtn" title="按识图结果把文件名改成「日期_关键词」（只改名字，不移动位置）">✨ 批量命名</button>
+    <button class="modal-btn danger" type="button" onclick="batchDelete()">批量删除</button>
+    <button class="modal-btn" type="button" onclick="clearSel()">清空</button>
+    <button class="modal-btn" type="button" onclick="toggleSelMode()">退出多选</button>
+  </div>
+
+  <!-- 批量命名的确认条：先把数字与样例摆出来，点了才真的动盘。 -->
+  <div class="selbar-confirm" id="selRenameBox" hidden>
+    <span id="selRenameText"></span>
+    <button class="modal-btn danger" type="button" onclick="confirmBatchRename()">✏️ 确认改名</button>
+    <button class="modal-btn" type="button" onclick="cancelBatchRename()">取消</button>
   </div>
 
   <div class="scroll-area" id="scrollArea">
@@ -81,8 +113,13 @@
 <div class="modal" id="modal" onclick="if(event.target===this)closeModal()">
   <span class="close" onclick="closeModal()">&times;</span>
   <div class="modal-content">
-    <img id="modalImg" src="" alt="">
-    <video id="modalVideo" controls hidden></video>
+    <!-- 媒体舞台。为什么必须有这层：图是靠 CSS transform:scale() 放大的，
+         transform 不参与布局 —— 没有 overflow:hidden 的容器把溢出裁掉，
+         放大后的图会盖住下面的工具条与信息框。 -->
+    <div class="modal-stage" id="modalStage">
+      <img id="modalImg" src="" alt="">
+      <video id="modalVideo" controls hidden></video>
+    </div>
     <div class="zoom-bar">
       <button class="zoom-btn nav-btn" type="button" onclick="modalPrev()" title="上一张 (←)">◀</button>
       <span class="zoom-level" id="zoomLevel">100%</span>
@@ -90,14 +127,23 @@
       <span class="nav-count" id="navCount"></span>
       <button class="zoom-btn" type="button" onclick="zoomImg(-0.25)" title="缩小">−</button>
       <button class="zoom-btn" type="button" onclick="zoomImg(0.25)" title="放大">+</button>
-      <button class="zoom-btn" type="button" onclick="resetZoom()" title="原始大小">⊡</button>
+      <button class="zoom-btn" type="button" onclick="resetZoom()" title="原始大小（重置缩放与位移）">1:1</button>
+      <button class="zoom-btn" type="button" onclick="toggleFullscreen()" id="fullBtn" title="全屏查看（Esc 退出）">⛶</button>
+      <button class="zoom-btn" type="button" onclick="openInSystem()" title="用系统默认播放器 / 看图器打开">↗</button>
       <button class="zoom-btn" type="button" onclick="toggleFavorite()" id="favBtn" title="收藏">☆</button>
     </div>
     <div class="modal-info">
       <div class="name" id="modalName"></div>
-      <div class="path" id="modalPath"></div>
+      <div class="modal-pathrow">
+        <code class="path" id="modalPath"></code>
+        <button class="modal-btn" type="button" onclick="revealInFolder()" title="在资源管理器中打开并选中">📂 所在文件夹</button>
+        <button class="modal-btn" type="button" onclick="tagWholeFolder()" title="给这张图所在目录里的全部图片打同一个标签">🏷 整目录打标</button>
+        <button class="modal-btn" type="button" id="aiOneBtn" onclick="aiDescribeCurrent()" title="用视觉模型看图，生成描述与标签">✨ 识图</button>
+      </div>
       <div class="detail-row"><span id="modalSize"></span><span id="modalDate"></span><span id="modalDim"></span></div>
       <div class="modal-tags" id="modalTags"></div>
+      <!-- 模型看图写的描述（识图产物）。没识过就隐藏，不占位置。 -->
+      <div class="modal-desc" id="modalDesc" hidden></div>
       <div class="modal-actions" id="modalActions">
         <input type="text" id="renameInput" placeholder="重命名…" class="rename-input">
         <button class="modal-btn" type="button" onclick="renameImage()" title="应用重命名">✏️ 改名</button>
@@ -105,6 +151,7 @@
         <button class="modal-btn" type="button" onclick="showGroupPanel()" title="添加标签">📁 分组</button>
         <button class="modal-btn danger" type="button" onclick="deleteImage()">删除</button>
       </div>
+      <!-- 整目录打标复用这个输入框（不再用 window.prompt —— Electron 渲染层不支持它）。 -->
       <div class="group-input" id="groupInput" hidden>
         <input type="text" id="groupInputField" placeholder="输入标签，逗号分隔" class="rename-input">
         <button class="modal-btn" type="button" onclick="addGroupTag()">➕ 添加</button>
@@ -153,6 +200,52 @@
     <div class="settings-group">
       <h3>内置素材</h3>
       <div id="builtinSourcesList" style="font-size:11px;color:#a39781;line-height:1.7">检测中…</div>
+    </div>
+
+    <div class="settings-group">
+      <h3>识图模型（看图打标签用）</h3>
+      <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:#6a5a4a;margin:6px 0 2px">
+        <input type="checkbox" id="cfgAiRename" onchange="saveAiRename(this.checked)">
+        识图后自动改文件名（格式：日期_关键词）
+      </label>
+      <div style="font-size:11px;color:#a39781;line-height:1.6;margin-bottom:4px">关着也不浪费：识图后会把建议名填进改名框，你看一眼点「✏️ 改名」就行。开了就真的改磁盘文件名（只改名字，不移动位置）。</div>
+      <select class="sort-select" id="cfgAiModel" style="width:100%" onchange="saveAiModel(this.value)">
+        <option value="">加载中…</option>
+      </select>
+      <div id="aiModelNote" style="font-size:11px;color:#a39781;line-height:1.7;margin-top:6px"></div>
+      <button class="action-btn secondary" type="button" onclick="loadAiModels(true)" style="margin-top:8px">🔄 拉取模型列表</button>
+    </div>
+
+    <div class="settings-group">
+      <h3>语义检索（向量）</h3>
+      <select class="sort-select" id="cfgEmbedModel" style="width:100%" onchange="saveEmbedModel(this.value)">
+        <option value="">检测中…</option>
+      </select>
+      <div id="embedInfo" style="font-size:11px;color:#a39781;line-height:1.7;margin-top:6px"></div>
+      <div style="font-size:11px;color:#a39781;line-height:1.7;margin-top:4px">标签栏可以直接<b>拖动排序</b>（拖一下就会记住顺序）。</div>
+
+    <div id="embedCustom" hidden style="margin-top:8px">
+        <input type="text" id="cfgEmbedBase" placeholder="https://api.siliconflow.cn/v1" style="width:100%;background:#fffdf8;border:1px solid #ded2be;border-radius:6px;padding:0 10px;height:28px;font-size:12px;color:#3a322a;outline:none;margin-bottom:6px">
+        <input type="password" id="cfgEmbedKey" placeholder="API key（只在本次运行内有效，不写盘）" style="width:100%;background:#fffdf8;border:1px solid #ded2be;border-radius:6px;padding:0 10px;height:28px;font-size:12px;color:#3a322a;outline:none;margin-bottom:6px">
+        <input type="text" id="cfgEmbedName" placeholder="模型名，如 BAAI/bge-m3" style="width:100%;background:#fffdf8;border:1px solid #ded2be;border-radius:6px;padding:0 10px;height:28px;font-size:12px;color:#3a322a;outline:none;margin-bottom:6px">
+        <button class="action-btn secondary" type="button" onclick="saveEmbedCustom()">保存自定义配置</button>
+      </div>
+      <div style="margin-top:8px">
+        <button class="action-btn secondary" type="button" onclick="testEmbed()" id="embedTestBtn">🔍 测试连接</button>
+        <button class="action-btn primary" type="button" onclick="startEmbedBuild()" id="embedBuildBtn">🧠 建语义索引</button>
+      </div>
+    </div>
+
+    <div class="settings-group">
+      <h3>索引维护</h3>
+      <button class="action-btn secondary" type="button" onclick="checkMissing()" id="missingBtn">🔍 检查失效记录</button>
+      <div id="missingBox" hidden style="margin-top:8px;font-size:11.5px;color:#6a5a4a;line-height:1.7">
+        <span id="missingText"></span>
+        <div style="margin-top:6px">
+          <button class="modal-btn danger" type="button" onclick="purgeMissing()">🧹 清理掉</button>
+          <button class="modal-btn" type="button" onclick="document.getElementById('missingBox').hidden=true">取消</button>
+        </div>
+      </div>
     </div>
 
     <div class="settings-group">

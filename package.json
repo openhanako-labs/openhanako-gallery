@@ -1,6 +1,6 @@
 {
   "name": "hanako-gallery",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "description": "HanaAgent 图库管理应用（v2）：目录导入、EXIF 索引、标签、缩略图、全文检索、Markdown 引用。",

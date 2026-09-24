@@ -175,7 +175,8 @@ gallery_forget imageIds=["uuid1","uuid2"]
 | `scanPaths` | string[] | `[]` | 扫描路径列表 |
 | `thumbnailSize` | number | `300` | 缩略图宽度（px） |
 | `blogImagesPath` | string | `public/images/gallery` | 博客图片目录 |
-| `autoClassify` | boolean | `true` | 自动按日期分类 |
+| `ffmpegPath` | string | `""` | 视频抽帧用的 ffmpeg 路径；留空则走 PATH，找不到则视频卡片显示占位 |
+| ~~`autoClassify`~~ | — | — | 已移除：原设计「按日期自动分目录」与「文件不动、分组只在 App 内」冲突，未接线 |
 
 ```
 gallery_config

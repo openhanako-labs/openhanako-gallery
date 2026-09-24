@@ -25,6 +25,7 @@ import path from "node:path";
 import http from "node:http";
 import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
+import { spawn as spawnProcess, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
 
 const DATA_DIR = process.argv[2] || process.env.HANAKO_PLUGIN_DATA || "";
@@ -92,8 +93,36 @@ const DEFAULT_CONFIG = {
   scanPaths: [],
   thumbnailSize: 300,
   blogImagesPath: "public/images/gallery",
-  autoClassify: true,
+  // 视频抽帧用的 ffmpeg。留空则走 PATH。不写死本机路径 —— 这是要发给别人的应用。
+  ffmpegPath: "",
+  // 识图用的视觉模型（由面板写入）。
+  aiModel: null,
+  // 语义向量。默认走 HANA_HOME 里已配好的 provider（source: 'hana' 就从
+  // provider-catalog.json / models.json 里取 baseUrl 与 key，不重复问用户要）。
+  // source: 'custom' 时用自定义 baseUrl/model；**apiKey 不落盘**（见 writeConfig）。
+  embed: {
+    source: "hana",
+    providerId: "siliconflow",
+    model: "BAAI/bge-m3",
+    baseUrl: "",
+    apiKey: "",
+    dimensions: 1024,
+  },
+  // 标签栏的手动顺序（用户拖出来的）。不在表里的标签排在后面，按名字。
+  tagOrder: [],
+  // 识图后是否自动改磁盘文件名。默认关 —— 改名动的是用户的真文件，得他主动开。
+  aiRenameOnDescribe: false,
 };
+
+/**
+ * 自定义 embedding key 的**内存副本**（绝不写盘）。
+ *
+ * 用户明确要求（2026-09-24）：key 不要落在磁盘上。
+ * 所以 config.json 里的 embed.apiKey 永远是空串，真正的 key 只活在这个变量里 ——
+ * 代价是服务重启后要重填。`/embed/sources` 会把「key 在不在内存里」如实报给 UI。
+ * 注：用 var 而不是 let —— writeConfig 定义在这行之前，用 let 会踩 TDZ。
+ */
+var _embedKeyOverride = "";
 
 // ── 能力探测（启动时一次，结果如实上报给 UI） ──
 //
@@ -108,6 +137,8 @@ const capabilities = {
   exifr: false,
   exifrError: null,
   exifrSource: null,
+  ffmpeg: false,
+  ffmpegPath: null,
   sqlite: true,
 };
 
@@ -445,6 +476,17 @@ try {
   capabilities.exifrError = String(e?.message || e).slice(0, 200);
 }
 
+// ffmpeg：只用于给视频抽一帧当缩略图。找不到就如实降级（视频卡片显示占位）。
+// 顺序：配置里的 ffmpegPath → PATH。不写死本机路径。
+let ffmpegPath = null;
+{
+  const cand = String(readConfig().ffmpegPath || "").trim() || "ffmpeg";
+  try {
+    const r = spawnSync(cand, ["-version"], { stdio: "ignore", timeout: 5000, windowsHide: true });
+    if (r.status === 0) { ffmpegPath = cand; capabilities.ffmpeg = true; capabilities.ffmpegPath = cand; }
+  } catch { /* 保持 ffmpeg = false */ }
+}
+
 // ── 配置 ──
 function readConfig() {
   try {
@@ -464,6 +506,41 @@ function writeConfig(patch) {
   }
   if (Array.isArray(clean.scanPaths)) {
     clean.scanPaths = clean.scanPaths.map((p) => String(p || "").trim()).filter(Boolean);
+  }
+  if (typeof clean.ffmpegPath === "string") clean.ffmpegPath = clean.ffmpegPath.trim();
+  // 识图用的模型：只收 { provider, model } 两个 ASCII 标识符，其它形状一律归 null。
+  // 宿主对这两个字段有字符集要求，脏值存进配置只会在调用时才爆 —— 不如入库前就卡掉。
+  if (clean.aiModel !== undefined) {
+    const p = String(clean.aiModel?.provider || "").trim();
+    const m = String(clean.aiModel?.model || "").trim();
+    clean.aiModel = p && m ? { provider: p, model: m } : null;
+  }
+  // 语义向量配置：只收已知字段，dimensions 转成正整数。
+  // **apiKey 不落盘**：非空的 key 只放进内存副本，写到磁盘的值一律清空。
+  if (clean.embed !== undefined) {
+    const e = clean.embed || {};
+    const dims = parseInt(e.dimensions, 10);
+    const k = String(e.apiKey || "").trim();
+    // 字段“出现”就接管内存副本（空串 = 清掉），这样 UI 上清空输入框能真的清掉；
+    // 字段不出现则不动（例如只改 source/model 的请求）。
+    if (e.apiKey !== undefined) _embedKeyOverride = k;
+    clean.embed = {
+      source: e.source === "custom" ? "custom" : "hana",
+      providerId: String(e.providerId || "siliconflow").trim(),
+      model: String(e.model || "").trim(),
+      baseUrl: String(e.baseUrl || "").trim(),
+      apiKey: "",
+      dimensions: Number.isFinite(dims) && dims > 0 ? dims : 1024,
+    };
+  }
+  if (clean.aiRenameOnDescribe !== undefined) clean.aiRenameOnDescribe = clean.aiRenameOnDescribe === true;
+  // 标签手动顺序：字符串数组，去重、限长。
+  if (Array.isArray(clean.tagOrder)) {
+    const seen = new Set();
+    clean.tagOrder = clean.tagOrder
+      .map((x) => String(x || "").trim())
+      .filter((x) => x && !seen.has(x) && seen.add(x))
+      .slice(0, 500);
   }
   const next = { ...readConfig(), ...clean };
   fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -555,6 +632,53 @@ function openDb() {
       DELETE FROM images_fts WHERE image_id = old.id;
     END;
   `);
+  // 增量扫描靠 (size, mtime) 判「文件是否变过」，旧库没这列 —— 补上。
+  // 已有行的 mtime_ms 为 NULL，首次增量重扫时会各哈希一遍，之后就是零成本跳过了。
+  try {
+    const cols = db.prepare("PRAGMA table_info(images)").all().map((c) => c.name);
+    if (!cols.includes("mtime_ms")) db.exec("ALTER TABLE images ADD COLUMN mtime_ms INTEGER");
+  } catch { /* 补列失败不致命，退化为每次都哈希 */ }
+
+  // 识图写的描述（模型看图说的那句中文）落在 images.description，并进 FTS。
+  //
+  // 两个坑：
+  //   1. FTS5 虚拟表**不能 ALTER 加列**，只能整表重建 + 重灌。
+  //   2. 旧触发器是 `AFTER UPDATE OF filename, path` —— 只写 description 不会触发
+  //      重索引，表现就是「识图跑完了但搜不到」。改成 `OF filename, path, description`。
+  // 用 fts 表自身的 SQL 文本判断是否已迁移，跑一次就跳过。
+  try {
+    const cols2 = db.prepare("PRAGMA table_info(images)").all().map((c) => c.name);
+    if (!cols2.includes("description")) db.exec("ALTER TABLE images ADD COLUMN description TEXT");
+    // 模型给的文件名短名（面板的「命名 / 批量命名」用它，而不是从标签里挑 ——
+    // 标签是检索维度，不是命名维度：实测挑出过 `C-二次元` 这种名字）。
+    if (!cols2.includes("ai_name")) db.exec("ALTER TABLE images ADD COLUMN ai_name TEXT");
+    const ftsSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'images_fts'").get()?.sql || "";
+    if (!/description/.test(ftsSql)) {
+      db.exec(`
+        DROP TRIGGER IF EXISTS images_fts_ai;
+        DROP TRIGGER IF EXISTS images_fts_au;
+        DROP TRIGGER IF EXISTS images_fts_ad;
+        DROP TABLE IF EXISTS images_fts;
+        CREATE VIRTUAL TABLE images_fts USING fts5(
+          image_id UNINDEXED, filename, path, description, tokenize='unicode61 remove_diacritics 1'
+        );
+        CREATE TRIGGER images_fts_ai AFTER INSERT ON images BEGIN
+          INSERT INTO images_fts(image_id, filename, path, description)
+          VALUES (new.id, hana_seg(new.filename), hana_seg(new.path), hana_seg(COALESCE(new.description, '')));
+        END;
+        CREATE TRIGGER images_fts_au AFTER UPDATE OF filename, path, description ON images BEGIN
+          DELETE FROM images_fts WHERE image_id = old.id;
+          INSERT INTO images_fts(image_id, filename, path, description)
+          VALUES (new.id, hana_seg(new.filename), hana_seg(new.path), hana_seg(COALESCE(new.description, '')));
+        END;
+        CREATE TRIGGER images_fts_ad AFTER DELETE ON images BEGIN
+          DELETE FROM images_fts WHERE image_id = old.id;
+        END;
+        INSERT INTO images_fts(image_id, filename, path, description)
+          SELECT id, hana_seg(filename), hana_seg(path), hana_seg(COALESCE(description, '')) FROM images;
+      `);
+    }
+  } catch { /* 迁移失败不致命：描述仍写进 images，只是搜不到 */ }
   fs.mkdirSync(THUMB_DIR, { recursive: true });
   return db;
 }
@@ -564,8 +688,10 @@ const q1 = (sql, params = []) => { const s = openDb().prepare(sql); return (para
 const run = (sql, params = []) => { const s = openDb().prepare(sql); return params.length ? s.run(...params) : s.run(); };
 
 // ── 文件工具 ──
-/** 按扩展名集合递归扫目录。includeVideo 时连视频一起收。 */
-function walkImages(root, limit = 200000, includeVideo = false) {
+/** 按扩展名集合递归扫目录。includeVideo 时连视频一起收。
+ *  stats 可选：传入对象时会把「因未开视频而被跳过的文件数」记到 videosSkipped，
+ *  供 /scan 如实上报 —— 否则用户收完提示根本不知道视频被静默跳过了。 */
+function walkImages(root, limit = 200000, includeVideo = false, stats = null) {
   const exts = includeVideo ? new Set([...IMAGE_EXTS, ...VIDEO_EXTS]) : IMAGE_EXTS;
   const out = [];
   const stack = [root];
@@ -577,7 +703,11 @@ function walkImages(root, limit = 200000, includeVideo = false) {
       if (e.name.startsWith(".")) continue;
       const full = path.join(dir, e.name);
       if (e.isDirectory()) { stack.push(full); continue; }
-      if (e.isFile() && exts.has(path.extname(e.name).toLowerCase())) out.push(full);
+      if (e.isFile()) {
+        const ext = path.extname(e.name).toLowerCase();
+        if (exts.has(ext)) { out.push(full); continue; }
+        if (stats && !includeVideo && VIDEO_EXTS.has(ext)) stats.videosSkipped++;
+      }
     }
   }
   return out;
@@ -587,6 +717,520 @@ function hashFile(file) {
   const h = crypto.createHash("sha256");
   h.update(fs.readFileSync(file));
   return h.digest("hex");
+}
+
+/**
+ * 缩略图缓存 key。
+ *
+ * 旧实现用 DB id（uuid），有三个硬伤：
+ *   1. 不入库的三类来源（gen_/builtin_/medlib_）拿不到 uuid → 没缩略图。
+ *   2. 同一个 id、源文件被替换 → 缓存命中旧图（key 没变）。
+ *   3. 同内容的两个不同文件各自生成一份缩略图（浪费磁盘，但无害）。
+ *
+ * 新 key = sha256(size + mtimeMs) 截断 20 字符：
+ *   · O(1) 计算，只 statSync，不读文件内容 —— 11MB 的 PNG 也不卡。
+ *   · 源文件被替换时 mtime 必变 → key 变 → 缓存失效 → 重新生成。
+ *   · 入库图的去重已由 DB 的 file_hash UNIQUE 保证，此处不再重复做。
+ *
+ * statSync 失败时返回 null，调用方降级为「无法缓存，直出原图」。
+ */
+function computeThumbKey(filePath) {
+  try {
+    const st = fs.statSync(filePath);
+    return crypto.createHash("sha256")
+      .update(`${st.size}:${st.mtimeMs}`)
+      .digest("hex").slice(0, 20);
+  } catch { return null; }
+}
+
+/** 把缩略图文件读成响应体。失败时返回 { ok: false } 让上层降级。
+ *  不回传绝对路径 —— 客户端拿不到也不需要，少一处本地路径外泄。 */
+function readThumbResponse(thumbPath, meta = {}) {
+  try {
+    const buf = fs.readFileSync(thumbPath);
+    return { ok: true, base64: buf.toString("base64"), mime: "image/webp", size: buf.length, ...meta };
+  } catch {
+    return { ok: false, error: "读取缩略图失败", fallbackOriginal: true };
+  }
+}
+
+/**
+ * 原图超过 MAX_IMAGE_BYTES 时的回传策略。
+ *
+ * 这个上限是给「把一张图塞进 base64 走 JSON-RPC」定的，不是给「看大图」定的。
+ * 直接 413 会让详情弹窗一片空白，所以 sharp 可用时给一张 1600px 的降采样预览，
+ * 并用 downscaled: true 如实标注（前端据此提示「已降采样」）—— 宁可看清是缩过的，
+ * 也不要让用户以为自己在看原图。sharp 不可用就退回如实报错。
+ */
+async function oversizedImageResponse(srcPath, st, isVideo = false) {
+  // 视频不试降采样：sharp 解不了 mp4，硬跑只会慢一遍再失败。
+  if (sharpLib && !isVideo) {
+    try {
+      fs.mkdirSync(THUMB_DIR, { recursive: true });
+      const key = computeThumbKey(srcPath) || crypto.randomUUID();
+      const previewPath = path.join(THUMB_DIR, `${key}@preview.webp`);
+      if (!fs.existsSync(previewPath)) {
+        await sharpLib(srcPath).rotate().resize(1600, 1600, { fit: "inside", withoutEnlargement: true })
+          .webp({ quality: 86 }).toFile(previewPath);
+      }
+      const buf = fs.readFileSync(previewPath);
+      return {
+        ok: true, mime: "image/webp", base64: buf.toString("base64"),
+        downscaled: true, originalSize: st.size, limit: MAX_IMAGE_BYTES,
+      };
+    } catch { /* 降采样失败 → 落到下面的如实报错 */ }
+  }
+  return { ok: false, error: "图片超过回传上限", tooLarge: true, size: st.size, limit: MAX_IMAGE_BYTES };
+}
+
+/** id → 真实文件路径（覆盖三类外部来源）。DB 内的 id 返回 null。 */
+function resolvePathById(id) {
+  if (id.startsWith("gen_")) return resolveGeneratedPath(id);
+  if (id.startsWith("builtin_")) return resolveBuiltinPath(id);
+  if (id.startsWith("medlib_")) return resolveMediaLibPath(id);
+  return null;
+}
+
+/**
+ * 用 ffmpeg 从视频里抽一帧当缩略图，落到 _thumbnails/ 缓存。
+ *
+ * 两段式：ffmpeg 先出 PNG（各平台 ffmpeg 都保证支持），再由 sharp 转 webp；
+ * sharp 缺席时直接留 PNG 用 —— 少见，但别让功能整个消失（所以 mime 要跟着走）。
+ * 抽帧点先试 0.5s（避开片头黑帧），短视频抽不到就退回第 0 帧。
+ *
+ * @returns {Promise<{path: string, mime: string}|null>}
+ */
+async function videoFrame(srcPath, size) {
+  if (!ffmpegPath) return null;
+  const key = computeThumbKey(srcPath) || crypto.randomUUID();
+  const pngPath = path.join(THUMB_DIR, `${key}.frame.png`);
+  const webpPath = path.join(THUMB_DIR, `${key}.webp`);
+  const vf = `scale=${size}:${size}:force_original_aspect_ratio=decrease`;
+  const grab = (ss) => spawnSync(ffmpegPath, [
+    "-y", "-v", "error", "-ss", String(ss), "-i", srcPath,
+    "-frames:v", "1", "-vf", vf, pngPath,
+  ], { timeout: 20000, windowsHide: true });
+  try {
+    fs.mkdirSync(THUMB_DIR, { recursive: true });
+    let r = grab(0.5);
+    if (r.status !== 0 || !fs.existsSync(pngPath)) r = grab(0);
+    if (r.status !== 0 || !fs.existsSync(pngPath)) return null;
+    if (!sharpLib) return { path: pngPath, mime: "image/png" };
+    await sharpLib(pngPath).webp({ quality: 82 }).toFile(webpPath);
+    try { fs.unlinkSync(pngPath); } catch { /* 清理失败无妨，下次覆盖 */ }
+    return { path: webpPath, mime: "image/webp" };
+  } catch { return null; }
+}
+
+/**
+ * 用系统默认程序打开一个文件（视频 → 默认播放器，图片 → 默认看图器）。
+ *
+ * 为什么用 explorer.exe 而不是 powershell 或 cmd：
+ *   explorer.exe 在 System32，任何 PATH 都在，且不需要引号游戏。
+ *   实测（2026-09-24）从受管服务里 spawn("powershell") 什么也没发生 ——
+ *   powershell 不在这个进程的 PATH 里，而 spawn 的失败是**异步**的，
+ *   上一版因此返回了假的 ok:true（点了没反应就是这个原因）。
+ *   现在一律 spawnSync 并如实上报。
+ *
+ * 只接受**服务端自己解析出来的**绝对路径 —— 路径绝不能从客户端传进来，
+ * 否则这两个路由就成了任意程序启动器。
+ *
+ * @returns {{ok: boolean, via?: string, code?: number, error?: string}}
+ */
+function openWithSystemDefault(filePath) {
+  const attempts = process.platform === "win32"
+    ? [
+        { bin: "explorer.exe", args: [filePath] },
+        { bin: "cmd.exe", args: ["/c", "start", "", filePath] },
+      ]
+    : process.platform === "darwin"
+      ? [{ bin: "open", args: [filePath] }]
+      : [{ bin: "xdg-open", args: [filePath] }];
+  let lastErr = "";
+  for (const a of attempts) {
+    let r;
+    try {
+      r = spawnSync(a.bin, a.args, { timeout: 8000, windowsHide: true });
+    } catch (e) {
+      lastErr = `${a.bin}: ${String(e?.message || e).slice(0, 160)}`;
+      continue;
+    }
+    if (!r.error) {
+      // explorer.exe 成功时也常常返回非 0，所以判定标准是「没抛 spawn 错误」；
+      // 但把 code 一并回上去，以后真出问题时能看出来。
+      return { ok: true, via: a.bin, code: r.status };
+    }
+    lastErr = `${a.bin}: ${String(r.error?.message || r.error).slice(0, 160)}`;
+  }
+  return { ok: false, error: lastErr || "未找到可用的启动器" };
+}
+
+/**
+ * 「打开所在文件夹，并把它顶到前台」—— 整件事一次 PowerShell 全包。
+ *
+ * 为什么要这么绕：
+ * 1) Windows 有前台锁（当年防弹窗骚扰的机制），后台进程调起的窗口只能落在最下面。
+ *    实测每次 explorer /select, 都真的开了窗（我数到过 19 个），但它们全堆在 Hana 后面
+ *    —— 用户看到的就是「点了没反应」。
+ *    破法：AttachThreadInput 把自己的线程接到当前前台线程的输入队列上，
+ *    借到前台权限后再 SetForegroundWindow（这是绕前台锁的标准做法）。
+ * 2) explorer /select, 每调一次就新开一个窗口，点十次堆十个。
+ *    所以先找这个目录已有的窗口：找到就只置前，不再开新的。
+ *
+ * 输出协议（Node 侧按行解析）：
+ *   REUSED focused / REUSED unfocused         已有窗口，置前 / 未置前
+ *   OPENED focused / OPENED unfocused / OPENED no-window
+ *   ERR-addtype / ERR-nofile
+ */
+const REVEAL_PS_LINES = [
+  "$ErrorActionPreference='Stop'",
+  'try {',
+  '  Add-Type -Namespace HanaFg -Name Win -MemberDefinition @\'',
+  '[DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr hWnd);',
+  '[DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);',
+  '[DllImport("user32.dll")] public static extern bool BringWindowToTop(IntPtr hWnd);',
+  '[DllImport("user32.dll")] public static extern IntPtr GetForegroundWindow();',
+  '[DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, IntPtr pid);',
+  '[DllImport("kernel32.dll")] public static extern uint GetCurrentThreadId();',
+  '[DllImport("user32.dll")] public static extern bool AttachThreadInput(uint a, uint b, bool f);',
+  "'@",
+  "} catch { 'ERR-addtype'; exit 3 }",
+  '$file = $env:HANA_GALLERY_REVEAL_FILE',
+  '$dir = $env:HANA_GALLERY_REVEAL_DIR',
+  "if (-not $file -or -not $dir) { 'ERR-nofile'; exit 4 }",
+  '$want = $dir.Replace([char]92, "/")',
+  '$sh = New-Object -ComObject Shell.Application',
+  'function Find-Target {',
+  '  foreach ($w in @($sh.Windows())) {',
+  '    try {',
+  '      $u = [System.Uri]::UnescapeDataString([string]$w.LocationURL)',
+  '      if ($u -like "*$want") { return $w }',
+  '    } catch { }',
+  '  }',
+  '  return $null',
+  '}',
+  'function Set-Front($w) {',
+  '  $h = [IntPtr]$w.HWND',
+  '  $fg = [HanaFg.Win]::GetForegroundWindow()',
+  '  $fgT = [HanaFg.Win]::GetWindowThreadProcessId($fg, [IntPtr]::Zero)',
+  '  $myT = [HanaFg.Win]::GetCurrentThreadId()',
+  '  [void][HanaFg.Win]::AttachThreadInput($myT, $fgT, $true)',
+  '  [void][HanaFg.Win]::ShowWindow($h, 9)',   // 9 = SW_RESTORE
+  '  [void][HanaFg.Win]::BringWindowToTop($h)',
+  '  $ok = [HanaFg.Win]::SetForegroundWindow($h)',
+  '  [void][HanaFg.Win]::AttachThreadInput($myT, $fgT, $false)',
+  '  return $ok',
+  '}',
+  '$win = Find-Target',
+  'if ($win) {',
+  "  if (Set-Front $win) { 'REUSED focused' } else { 'REUSED unfocused' }",
+  '  exit 0',
+  '}',
+  "Start-Process -FilePath 'explorer.exe' -ArgumentList '/select,', $file",
+  'for ($i = 0; $i -lt 8 -and -not $win; $i++) {',
+  '  Start-Sleep -Milliseconds 350',
+  '  $win = Find-Target',
+  '}',
+  "if (-not $win) { 'OPENED no-window'; exit 0 }",
+  "if (Set-Front $win) { 'OPENED focused' } else { 'OPENED unfocused' }",
+];
+const REVEAL_PS_B64 = Buffer.from(REVEAL_PS_LINES.join("\r\n"), "utf16le").toString("base64");
+
+/**
+ * 找 PowerShell 的绝对路径。
+ * 不靠 PATH —— 受管服务进程的 PATH 是宿主白名单，裸名 `powershell` 实测调不起来。
+ */
+function findPowershell() {
+  const root = process.env.SystemRoot || process.env.windir || "C:\\Windows";
+  const p = path.join(root, "System32", "WindowsPowerShell", "v1.0", "powershell.exe");
+  return fs.existsSync(p) ? p : "powershell.exe";
+}
+
+/**
+ * 在系统文件管理器里定位到某个文件（打开所在文件夹并选中），并把窗口顶到前台。
+ * 只收服务端解析出来的路径。返回 { ok, via, mode, focused, detail }。
+ *
+ * PowerShell 跑不通时（被拦/不在）退回直接 explorer /select,：窗口能开出来，
+ * 但会落在 Hana 后面 —— 如实报 focused:false，不假报成功。
+ */
+function revealInExplorer(filePath) {
+  if (process.platform !== "win32") return openWithSystemDefault(path.dirname(filePath));
+  const dir = path.dirname(filePath);
+  let out = "";
+  let err = "";
+  try {
+    const r = spawnSync(
+      findPowershell(),
+      ["-NoProfile", "-NonInteractive", "-EncodedCommand", REVEAL_PS_B64],
+      {
+        timeout: 25000,
+        windowsHide: true,
+        encoding: "utf8",
+        env: { ...process.env, HANA_GALLERY_REVEAL_FILE: filePath, HANA_GALLERY_REVEAL_DIR: dir },
+      },
+    );
+    out = String(r.stdout || "").trim();
+    err = r.error ? String(r.error.message) : "";
+  } catch (e) {
+    err = String(e?.message || e);
+  }
+
+  const m = out.match(/\b(REUSED|OPENED)\b[ \t]*(focused|unfocused|no-window)?/);
+  if (m) {
+    return {
+      ok: true,
+      via: "powershell+explorer",
+      mode: m[1].toLowerCase(),
+      focused: m[2] === "focused",
+      detail: out.slice(0, 160),
+    };
+  }
+
+  const detail = (out || err || "no-output").slice(0, 160);
+  try {
+    const r2 = spawnSync("explorer.exe", ["/select,", filePath], { timeout: 8000 });
+    if (r2.error) return { ok: false, error: `${detail} / explorer: ${String(r2.error.message).slice(0, 120)}` };
+    return { ok: true, via: "explorer.exe", mode: "fallback", focused: false, detail };
+  } catch (e) {
+    return { ok: false, error: `${detail} / ${String(e?.message || e).slice(0, 120)}` };
+  }
+}
+
+/* ═══════ 语义向量（embedding）═══════
+ *
+ * 为什么绕开宿主契约：`app/models.infer` 的 stream 是给对话用的，而且它的标识符
+ * 校验（^[A-Za-z0-9._:-]{1,128}$）会把 `BAAI/bge-m3` 这种带斜杠的 embedding 模型名拒掉。
+ * 所以这里**由图库服务直连 provider 的 /embeddings**，key 从 HANA_HOME 里读
+ * （provider-catalog.json / models.json）—— 跟表情包插件的做法一致，不重复问用户要 key。
+ *
+ * 向量不进 sqlite：几万个 float 塞进库只会拖慢一切。单独一个二进制文件（Float32）
+ * 配一个 meta.json（id / 文本指纹 / 模型 / 维度），内存里算余弦，不引 FAISS。
+ */
+const VECTORS_BIN = path.join(DATA_DIR, "_vectors.bin");
+const VECTORS_META = path.join(DATA_DIR, "_vectors.meta.json");
+
+function readJsonSafe(p) {
+  try { return JSON.parse(fs.readFileSync(p, "utf-8")); } catch { return null; }
+}
+
+/** 从 HANA_HOME 认出可用的 embedding 候选（只报有没有 key，绝不回传 key 本身）。 */
+function discoverEmbedCandidates() {
+  const models = readJsonSafe(path.join(HANA_HOME, "models.json"));
+  const catalog = readJsonSafe(path.join(HANA_HOME, "provider-catalog.json"));
+  const providers = models?.providers || {};
+  const out = [];
+  for (const [pid, pv] of Object.entries(providers)) {
+    const list = Array.isArray(pv?.models) ? pv.models : [];
+    for (const m of list) {
+      const id = String(m?.id || m?.model || "");
+      // 认名字：带 bge/embed/gte/m3 的当 embedding；带 rerank 的一律排除（它不是 embedding）。
+      if (!/bge|embed|gte-|m3/i.test(id) || /rerank/i.test(id)) continue;
+      const key = String(catalog?.providers?.[pid]?.api_key || pv?.apiKey || "").trim();
+      const base = String(catalog?.providers?.[pid]?.base_url || pv?.baseUrl || "").trim();
+      out.push({
+        providerId: pid,
+        model: id,
+        name: String(m?.name || id),
+        baseUrl: base,
+        hasKey: !!key,
+      });
+    }
+  }
+  return out;
+}
+
+/** 解析出真正要用的 { baseUrl, apiKey, model, dimensions }。 */
+function resolveEmbedApi(cfg) {
+  const c = cfg || readConfig().embed || {};
+  if (c.source === "custom") {
+    return {
+      baseUrl: String(c.baseUrl || ""),
+      // 盘上的 apiKey 永远是空串 —— 真正的 key 在内存副本里。
+      apiKey: _embedKeyOverride || String(c.apiKey || ""),
+      model: String(c.model || ""),
+      dimensions: Number(c.dimensions) || 1024,
+    };
+  }
+  const pid = String(c.providerId || "siliconflow");
+  const catalog = readJsonSafe(path.join(HANA_HOME, "provider-catalog.json"));
+  const models = readJsonSafe(path.join(HANA_HOME, "models.json"));
+  const pv = models?.providers?.[pid] || {};
+  return {
+    baseUrl: String(catalog?.providers?.[pid]?.base_url || pv?.baseUrl || ""),
+    apiKey: String(catalog?.providers?.[pid]?.api_key || pv?.apiKey || ""),
+    model: String(c.model || ""),
+    dimensions: Number(c.dimensions) || 1024,
+  };
+}
+
+/** 调一次 /embeddings。批量传，但调用方要控制每批大小。 */
+async function embedTexts(texts, cfg) {
+  const list = (Array.isArray(texts) ? texts : [texts]).map((t) => String(t ?? "").slice(0, 4000));
+  if (!list.length) return { ok: true, vectors: [] };
+  const { baseUrl, apiKey, model } = resolveEmbedApi(cfg);
+  if (!baseUrl || !apiKey || !model) {
+    return { ok: false, error: "embedding 配置不完整（缺 baseUrl / apiKey / model）" };
+  }
+  if (typeof fetch !== "function") return { ok: false, error: "当前运行时没有 fetch" };
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 60000);
+  try {
+    const resp = await fetch(`${baseUrl.replace(/\/+$/, "")}/embeddings`, {
+      method: "POST",
+      headers: { Authorization: `Bearer ${apiKey}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ model, input: list }),
+      signal: ctrl.signal,
+    });
+    if (!resp.ok) {
+      const t = await resp.text().catch(() => "");
+      return { ok: false, error: `Embedding API HTTP ${resp.status}: ${String(t).slice(0, 200)}` };
+    }
+    const data = await resp.json();
+    const arr = Array.isArray(data?.data) ? data.data : [];
+    const vectors = arr.map((d) => (Array.isArray(d?.embedding) ? d.embedding : null)).filter(Boolean);
+    if (vectors.length !== list.length) {
+      return { ok: false, error: `返回向量数不匹配（要 ${list.length} 得 ${vectors.length}）` };
+    }
+    return { ok: true, vectors };
+  } catch (e) {
+    return { ok: false, error: String(e?.message || e) };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** 向量缓存：{ dims, ids:[], hashes:[], mat: Float32Array } */
+let _vecCache = null;
+
+function loadVectors(force = false) {
+  if (_vecCache && !force) return _vecCache;
+  const meta = readJsonSafe(VECTORS_META);
+  if (!meta || !Array.isArray(meta.ids) || !meta.ids.length) { _vecCache = null; return null; }
+  try {
+    const buf = fs.readFileSync(VECTORS_BIN);
+    const dims = Number(meta.dims) || 1024;
+    const n = meta.ids.length;
+    if (buf.length < n * dims * 4) return null;
+    const mat = new Float32Array(buf.buffer, buf.byteOffset, n * dims);
+    _vecCache = { dims, ids: meta.ids, hashes: meta.hashes || [], model: meta.model || "", mat };
+    return _vecCache;
+  } catch { return null; }
+}
+
+/** 归一化（写盘前做一次，搜索时就只是点积）。 */
+function normalizeVec(v) {
+  let s = 0;
+  for (let i = 0; i < v.length; i++) s += v[i] * v[i];
+  const n = Math.sqrt(s) || 1;
+  const out = new Float32Array(v.length);
+  for (let i = 0; i < v.length; i++) out[i] = v[i] / n;
+  return out;
+}
+
+/** 余弦 top-K。入库前归一化过，所以点积就是余弦。 */
+function vectorTopK(queryVec, k) {
+  const cache = loadVectors();
+  if (!cache) return [];
+  const { dims, ids, mat } = cache;
+  if (queryVec.length !== dims) return [];
+  const q = normalizeVec(queryVec);
+  const scored = [];
+  for (let r = 0; r < ids.length; r++) {
+    const off = r * dims;
+    let dot = 0;
+    for (let i = 0; i < dims; i++) dot += mat[off + i] * q[i];
+    scored.push({ id: ids[r], score: dot });
+  }
+  scored.sort((a, b) => b.score - a.score);
+  return scored.slice(0, Math.min(200, Math.max(1, k)));
+}
+
+/** 一张图要拿去算向量的文本：文件名 + 模型写的描述 + 标签。 */
+function imageEmbedText(row) {
+  const base = String(row.filename || "").replace(/\.[^.]+$/, "").replace(/[_.-]+/g, " ");
+  return [base, String(row.description || ""), String(row.tagtext || "")].filter(Boolean).join("\n").slice(0, 2000);
+}
+
+/** 文本指纹：描述/标签改了才知道该重建哪几条。 */
+function textHash(s) {
+  return crypto.createHash("sha256").update(String(s)).digest("hex").slice(0, 16);
+}
+
+/** 后台建索引任务（服务内跑，UI 轮询 /embed/build/status 看进度）。 */
+let _embedJob = null;
+
+async function runEmbedBuild(cfg) {
+  const rows = q(`SELECT i.id, i.filename, i.description,
+                         (SELECT GROUP_CONCAT(t.name, ' ') FROM image_tags it
+                            JOIN tags t ON t.id = it.tag_id WHERE it.image_id = i.id) AS tagtext
+                    FROM images i WHERE i.hidden = 0 AND i.path NOT LIKE 'ext:%'`);
+  const total = rows.length;
+  const job = _embedJob = {
+    running: true, total, done: 0, failed: 0, skipped: 0,
+    startedAt: Date.now(), finishedAt: null, error: "", cancel: false,
+  };
+
+  const prev = loadVectors(true);
+  const prevIndex = new Map();
+  if (prev) prev.ids.forEach((id, i) => prevIndex.set(id, i));
+  const meta = prev ? { dims: prev.dims, ids: prev.ids.slice(), hashes: prev.hashes.slice(), model: prev.model } : { dims: 0, ids: [], hashes: [], model: "" };
+  const keep = [];   // 保留下来的旧向量（Float32Array）
+
+  const BATCH = 24;
+  let dims = meta.dims;
+
+  // 先处理「无需重建」的：文本指纹没变的旧向量直接留用。
+  const todo = [];
+  for (const r of rows) {
+    const text = imageEmbedText(r);
+    const h = textHash(text);
+    const pi = prevIndex.get(r.id);
+    if (prev && pi != null && prev.hashes[pi] === h) {
+      keep.push({ id: r.id, hash: h, vec: prev.mat.subarray(pi * prev.dims, (pi + 1) * prev.dims) });
+      job.skipped++;
+      job.done++;
+    } else {
+      todo.push({ id: r.id, hash: h, text });
+    }
+  }
+
+  const fresh = [];
+  for (let i = 0; i < todo.length; i += BATCH) {
+    if (job.cancel) { job.error = "已中止"; break; }
+    const chunk = todo.slice(i, i + BATCH);
+    const r = await embedTexts(chunk.map((c) => c.text), cfg);
+    if (!r.ok) { job.error = r.error; job.failed += chunk.length; break; }
+    for (let j = 0; j < chunk.length; j++) {
+      const v = r.vectors[j];
+      if (!dims) dims = v.length;
+      if (v.length !== dims) { job.failed++; continue; }
+      fresh.push({ id: chunk[j].id, hash: chunk[j].hash, vec: normalizeVec(v) });
+    }
+    job.done += chunk.length;
+    job.updatedAt = Date.now();
+  }
+
+  // 写盘：保留的 + 新的（旧的没进 keep 也没进 fresh 的等价于被丢弃）
+  const all = keep.concat(fresh).filter((x) => x.vec && x.vec.length === dims);
+  try {
+    const buf = Buffer.alloc(all.length * dims * 4);
+    all.forEach((x, r) => { for (let c = 0; c < dims; c++) buf.writeFloatLE(x.vec[c], (r * dims + c) * 4); });
+    fs.writeFileSync(VECTORS_BIN, buf);
+    fs.writeFileSync(VECTORS_META, JSON.stringify({
+      model: resolveEmbedApi(cfg).model, dims,
+      builtAt: new Date().toISOString(),
+      ids: all.map((x) => x.id), hashes: all.map((x) => x.hash),
+    }));
+    _vecCache = null;
+  } catch (e) {
+    job.error = `写向量文件失败: ${String(e?.message || e)}`;
+  }
+
+  job.running = false;
+  job.finishedAt = Date.now();
+  job.indexed = all.length;
+  job.dims = dims;
+  return job;
 }
 
 /** 目标路径已存在时追加 -1 / -2 …，直到不冲突。 */
@@ -898,32 +1542,86 @@ const routes = {
       : (typeof body.path === "string" && body.path.trim() ? [body.path.trim()] : []);
     const targets = explicit.length
       ? explicit
-      : (cfg.scanPaths?.length ? cfg.scanPaths : [cfg.galleryRoot]);
+      : (() => {
+          // 默认扫「配置里所有该看的目录」：scanPaths ∪ galleryRoot。
+          // 旧实现是 scanPaths 非空就忽略 galleryRoot —— 于是「图库根目录」其实从没被扫过，
+          // 往根目录里新放的图永远不会自己出现（要等下一次扫描）。
+          const set = [];
+          for (const p of [...(cfg.scanPaths || []), cfg.galleryRoot]) {
+            const t = String(p || "").trim();
+            if (t && !set.includes(t) && fs.existsSync(t)) set.push(t);
+          }
+          return set.length ? set : [cfg.galleryRoot];
+        })();
     const started = Date.now();
-    let imported = 0, skipped = 0, failed = 0, scanned = 0;
+    let imported = 0, skipped = 0, failed = 0, scanned = 0, updated = 0;
+    const walkStats = { videosSkipped: 0 };
     const errors = [];
+
+    // 增量：先把「路径 → 已知记录」整表读进内存，用于零成本跳过未变文件。
+    // 旧实现对每个文件都 hashFile —— 6004 张的库每次扫描要把整个库读一遍，
+    // 所以「面板一打开就自动刷新」在旧实现下根本不可行。
+    const known = new Map();
+    for (const r of q("SELECT id, path, size_bytes, mtime_ms FROM images")) {
+      if (r.path && !String(r.path).startsWith("ext:")) known.set(String(r.path), r);
+    }
 
     for (const target of targets) {
       if (!fs.existsSync(target)) { errors.push({ path: target, error: "目录不存在" }); continue; }
-      const files = walkImages(target, 200000, body.showVideo === true);
+      const files = walkImages(target, 200000, body.showVideo === true, walkStats);
       scanned += files.length;
       for (const file of files) {
         try {
-          const hash = hashFile(file);
-          if (q1("SELECT id FROM images WHERE file_hash = ?", [hash])) { skipped++; continue; }
           const st = fs.statSync(file);
+          const prev = known.get(file);
+          // ① 已知且未变 → 跳过。
+          //
+          //    这里**绝不写盘**。曾经为了给旧库补 mtime_ms，对每个未变文件也 UPDATE 一次，
+          //    实测 5748 行 = **79.8 秒**（每条 UPDATE 各自一次事务提交/fsync）；
+          //    而同一批文件在“零写入”下只要 **0.43 秒**。差的是写入，不是读盘。
+          //
+          //    没有 mtime_ms 的旧行（升级前入库的）只比 size 就算「未变」，也不回填 ——
+          //    代价是「同 size 的内容替换」在它们身上会漏判；等它们真变了（size 变）
+          //    会被 UPDATE 一次，从那以后就有 mtime 了。
+          if (prev) {
+            const unchanged = prev.mtime_ms != null
+              ? (`${prev.size_bytes}:${prev.mtime_ms}` === `${st.size}:${Math.round(st.mtimeMs)}`)
+              : (Number(prev.size_bytes) === st.size);
+            if (unchanged) { skipped++; continue; }
+          }
+
+          const hash = hashFile(file);   // 只有新增或变化的文件走到这里
+          // ② 路径已知但内容变了 → 原地更新，**保留 id 与已打的标签**
+          if (prev) {
+            const dup = q1("SELECT id FROM images WHERE file_hash = ? AND id <> ?", [hash, prev.id]);
+            if (dup) { run("DELETE FROM images WHERE id = ?", [prev.id]); skipped++; continue; }
+            const ex = await readExif(file);
+            run(`UPDATE images SET file_hash = ?, size_bytes = ?, mtime_ms = ?, width = ?, height = ?,
+                 date_taken = ?, date_modified = ?, camera_make = ?, camera_model = ? WHERE id = ?`, [
+              hash, st.size, Math.round(st.mtimeMs),
+              ex.width ?? null, ex.height ?? null,
+              ex.date_taken || st.mtime.toISOString(), st.mtime.toISOString(),
+              ex.camera_make ?? null, ex.camera_model ?? null, prev.id,
+            ]);
+            updated++;
+            continue;
+          }
+          // ③ 内容已存在（同一张图换个位置）→ 去重跳过
+          if (q1("SELECT id FROM images WHERE file_hash = ?", [hash])) { skipped++; continue; }
+
           const ex = await readExif(file);
           const now = new Date().toISOString();
           run(`INSERT INTO images (id, file_hash, path, filename, ext, size_bytes, width, height,
-               date_taken, date_imported, date_modified, camera_make, camera_model, thumbnail_path, hidden, source_path)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?)`, [
+               date_taken, date_imported, date_modified, camera_make, camera_model, thumbnail_path, hidden, source_path, mtime_ms)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?)`, [
             crypto.randomUUID(), hash, file, path.basename(file),
             path.extname(file).toLowerCase().replace(".", ""), st.size,
             ex.width ?? null, ex.height ?? null,
-            ex.date_taken || st.mtime.toISOString(), now, now,
+            ex.date_taken || st.mtime.toISOString(), now, st.mtime.toISOString(),
             ex.camera_make ?? null, ex.camera_model ?? null,
             null,   // thumbnail_path：首次入库尚未生成
             target, // source_path（存归一化路径，与 v1 一致，便于移除目录时清理）
+            Math.round(st.mtimeMs),
           ]);
           imported++;
         } catch (e) {
@@ -932,7 +1630,7 @@ const routes = {
         }
       }
     }
-    return { ok: true, summary: { scanned, imported, skipped, failed, duration_ms: Date.now() - started, targets }, errors };
+    return { ok: true, summary: { scanned, imported, updated, skipped, failed, videosSkipped: walkStats.videosSkipped, duration_ms: Date.now() - started, targets }, errors };
   },
 
   /**
@@ -973,6 +1671,27 @@ const routes = {
     if (body.date_to) { conds.push("date_taken <= ?"); params.push(body.date_to + "T23:59:59"); }
     if (body.ext) { conds.push("ext = ?"); params.push(String(body.ext).toLowerCase().replace(".", "")); }
 
+    // 只看视频（🎬 按钮的真语义 —— 不是「包含视频」，因为图片太多了）。
+    if (body.videoOnly === true) {
+      const vids = [...VIDEO_EXTS].map((e) => e.slice(1));
+      conds.push(`ext IN (${vids.map(() => "?").join(",")})`);
+      params.push(...vids);
+    }
+
+    // 按目录过滤（文件夹维度）。用前缀匹配但要防住「<root>\a 命中 <root>\ab」，
+    // 所以同时接受「正好等于」与「后面跟一个分隔符」两种。
+    if (body.folder) {
+      const f = String(body.folder).replace(/[\\/]+$/, "");
+      conds.push("(path = ? OR path LIKE ? OR path LIKE ?)");
+      params.push(f, f + "\\%", f + "/%");
+    }
+
+    // 未分类：一条标签都没打过。注意「☆ 收藏」也是一条标签，收藏过的就不算未分类了 ——
+    // 对“把没归过类的东西倒出来处理”这个用途来说，这个口径是对的。
+    if (body.uncategorized === true) {
+      conds.push("id NOT IN (SELECT image_id FROM image_tags)");
+    }
+
     // 比例 / 收藏筛选。阈值与 v1 服务端一致（1.2 / 0.8 / 0.9-1.1）。
     const ratio = String(body.ratio || "");
     if (ratio === "favorite") {
@@ -1005,6 +1724,7 @@ const routes = {
       if (wantSource === "generated") all = listGenerated({ ...pick, sources: body.generatedSources || null });
       else if (wantSource === "builtin") all = listBuiltin({ ...pick, sources: body.builtinSources || null });
       else all = listMediaLib(pick);
+      if (body.videoOnly === true) all = all.filter((x) => x.media_type === "video");
       all.sort(SORT_CMP[String(body.sort || "date_desc")] || SORT_CMP.date_desc);
       const t = all.length;
       const off = Math.min(offset, Math.max(0, t));
@@ -1024,7 +1744,7 @@ const routes = {
 
     const where = conds.join(" AND ");
     const total = q1(`SELECT COUNT(*) AS c FROM images WHERE ${where}`, params)?.c ?? 0;
-    const rows = q(`SELECT id, filename, ext, path, size_bytes, width, height, date_taken, date_imported, thumbnail_path
+    const rows = q(`SELECT id, filename, ext, path, size_bytes, width, height, date_taken, date_imported, thumbnail_path, description, ai_name
                     FROM images WHERE ${where} ORDER BY ${orderBy} LIMIT ? OFFSET ?`,
       [...params, limit, offset]);
 
@@ -1041,15 +1761,16 @@ const routes = {
     // 内置素材（随宿主发布的封面图库/角色卡/纹理）与集中媒体库（AI 生成产物的落地处）
     // 同样走尾部追加，三者合并去重后**按 sort 重新排** —— 否则切换排序对它不生效，
     // 因为这三个来源不入库，SQL 的 ORDER BY 管不到它们。
-    if (body.showGenerated !== false && !body.tag && !body.ratio && offset === 0) {
+    if (body.showGenerated !== false && !body.tag && !body.ratio && !body.folder && offset === 0) {
       const pick = { includeVideo: body.showVideo === true, keyword: body.keyword || "" };
       const gen = listGenerated({ ...pick, sources: body.generatedSources || null });
       const builtin = listBuiltin({ ...pick, sources: body.builtinSources || null });
       const medlib = listMediaLib(pick);
       const seen = new Set(rows.map((r) => r.path));
-      const extra = gen.concat(builtin, medlib)
-        .filter((g) => !seen.has(g.path))
-        .sort(SORT_CMP[String(body.sort || "date_desc")] || SORT_CMP.date_desc);
+      let extra = gen.concat(builtin, medlib).filter((g) => !seen.has(g.path));
+      // 只看视频时，这三个来源也得过同一道筛。
+      if (body.videoOnly === true) extra = extra.filter((g) => g.media_type === "video");
+      extra.sort(SORT_CMP[String(body.sort || "date_desc")] || SORT_CMP.date_desc);
       results = rows.concat(extra.slice(0, Math.max(0, limit - rows.length)));
     }
     return {
@@ -1067,26 +1788,286 @@ const routes = {
     status: "ok",
     tags: q(`SELECT t.id, t.name, COUNT(it.image_id) AS image_count FROM tags t
              LEFT JOIN image_tags it ON t.id = it.tag_id GROUP BY t.id ORDER BY t.name`),
+    // 用户拖出来的手动顺序（标签栏用它排前面）。不在表里的排后面，按名字。
+    order: readConfig().tagOrder || [],
+    // 「未分类」入口的计数：一条标签都没打过的入库图片。与直接请求
+    // /search?uncategorized=true 同口径，省一次往返。
+    uncategorized: q1(`SELECT COUNT(*) AS c FROM images WHERE hidden = 0
+                       AND id NOT IN (SELECT image_id FROM image_tags)`)?.c ?? 0,
   }),
 
-  /** 标签增删（v1 前端格式：{ id, tags: [...], action?: 'add'|'remove' }）。 */
+  /**
+   * 标签增删。入参三种形式（可叠加）：
+   *   · 单张  { id, tags: [...] }
+   *   · 批量  { ids: [...], tags: [...] }
+   *   · 整目录 { folder, tags: [...] }   ← 「一整个文件夹分类」落在服务端
+   *
+   * 为什么整目录要在服务端展开：前端手里只有当前页的 id，让它自己凑 ids 会在
+   * 分页/筛选下漏掉大部分图片 —— 这种“看起来干了其实没干完”最难受。
+   */
   "/tags": async (_req, body) => {
-    const id = body.id || body.imageId;
-    if (!id) return { ok: false, status: "error", error: "missing id" };
+    let ids = Array.isArray(body.ids)
+      ? body.ids.map(String)
+      : (body.id || body.imageId ? [String(body.id || body.imageId)] : []);
+    const folder = String(body.folder || "").trim();
+    if (!ids.length && folder) {
+      const f = folder.replace(/[\\/]+$/, "");
+      ids = q("SELECT id FROM images WHERE hidden = 0 AND (path = ? OR path LIKE ? OR path LIKE ?)",
+        [f, f + "\\%", f + "/%"]).map((r) => r.id);
+    }
+    if (!ids.length) return { ok: false, status: "error", error: "missing id / ids / folder" };
+
     const names = (Array.isArray(body.tags) ? body.tags : [body.tags])
       .map((s) => String(s || "").trim()).filter(Boolean);
+    if (!names.length) return { ok: false, status: "error", error: "missing tags" };
     const remove = body.action === "remove";
 
+    // 标签名先各查一次，避免在图片循环里反复 INSERT OR IGNORE。
+    const tagIds = [];
     for (const name of names) {
-      let t = q1("SELECT id FROM tags WHERE name = ?", [name]);
       if (remove) {
-        if (t) run("DELETE FROM image_tags WHERE image_id = ? AND tag_id = ?", [id, t.id]);
+        const t = q1("SELECT id FROM tags WHERE name = ?", [name]);
+        if (t) tagIds.push(t.id);
         continue;
       }
-      if (!t) { run("INSERT OR IGNORE INTO tags (name) VALUES (?)", [name]); t = q1("SELECT id FROM tags WHERE name = ?", [name]); }
-      if (t) run("INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?, ?)", [id, t.id]);
+      run("INSERT OR IGNORE INTO tags (name) VALUES (?)", [name]);
+      const t = q1("SELECT id FROM tags WHERE name = ?", [name]);
+      if (t) tagIds.push(t.id);
     }
-    return { ok: true, status: "ok" };
+
+    let changed = 0;
+    for (const id of ids) {
+      for (const tid of tagIds) {
+        if (remove) run("DELETE FROM image_tags WHERE image_id = ? AND tag_id = ?", [id, tid]);
+        else run("INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?, ?)", [id, tid]);
+      }
+      changed++;
+    }
+    return { ok: true, status: "ok", images: changed, tags: tagIds.length };
+  },
+
+  /**
+   * 清掉没有任何图片引用的空标签。
+   *
+   * 删图、或把某个标签从最后一张图上移除之后，`tags` 里会留下计数为 0 的空壳，
+   * 标签列表里看着很脏。这是纯维护动作，不碰图片。
+   */
+  "/tags/prune": async () => {
+    const before = q1("SELECT COUNT(*) AS c FROM tags")?.c ?? 0;
+    run("DELETE FROM tags WHERE id NOT IN (SELECT DISTINCT tag_id FROM image_tags)");
+    const after = q1("SELECT COUNT(*) AS c FROM tags")?.c ?? 0;
+    return { ok: true, status: "ok", removed: before - after, left: after };
+  },
+
+  /**
+   * 失效记录检测：库里记着、磁盘上已经没有的文件。
+   *
+   * 文件被移走/改名后，旧记录不会自己消失（增量扫描只走现有文件），
+   * 越积越多，点开是空的。这里只报告、不删 —— 先让用户看到数字再决定。
+   * 每条都 existsSync 一遍：六千多张在本地盘上是毫秒级，不值得为它缓存什么。
+   */
+  "/missing": async (_req, body) => {
+    const limit = Math.min(200, Math.max(1, Number(body.limit) || 50));
+    const rows = q("SELECT id, path, filename FROM images WHERE hidden = 0 AND path NOT LIKE 'ext:%'");
+    const missing = [];
+    for (const r of rows) {
+      const p = String(r.path || "");
+      if (!p || fs.existsSync(p)) continue;
+      missing.push({ id: r.id, path: p, filename: r.filename });
+    }
+    return {
+      ok: true,
+      status: "ok",
+      checked: rows.length,
+      missing: missing.length,
+      samples: missing.slice(0, limit),
+      truncated: missing.length > limit,
+    };
+  },
+
+  /**
+   * 清理失效记录。**只删索引记录与它的缩略图缓存，绝不动磁盘**（源文件已经不在了）。
+   * 文件只是被移走的话，重新扫描会以新路径重新入库 —— 所以这一步是可逆的。
+   */
+  "/missing/purge": async () => {
+    const rows = q("SELECT id, path, thumbnail_path FROM images WHERE hidden = 0 AND path NOT LIKE 'ext:%'");
+    let removed = 0;
+    let thumbs = 0;
+    for (const r of rows) {
+      const p = String(r.path || "");
+      if (!p || fs.existsSync(p)) continue;
+      if (r.thumbnail_path) { try { fs.unlinkSync(r.thumbnail_path); thumbs++; } catch { /* 已不在 */ } }
+      run("DELETE FROM image_tags WHERE image_id = ?", [r.id]);
+      run("DELETE FROM images WHERE id = ?", [r.id]);
+      removed++;
+    }
+    return { ok: true, status: "ok", removed, thumbs };
+  },
+
+  /**
+   * 识图用的「小图」：把原图缩到 ≤1024px 的 webp，回 base64。
+   *
+   * 为什么不回原图：宿主模型的视觉输入**只收 base64 字节**（不收路径、不收 URL），
+   * 一张 11MB 的 PNG base64 之后是 15MB 字符串 —— 走 HTTP 转一遍纯属自虐。
+   * 1024px webp 大约 100-200KB，识图足够。
+   * 视频一律拒：sharp 读不了，识图也只做图片。
+   */
+  "/ai/preview": async (_req, body) => {
+    const id = String(body.id || "");
+    const img = q1("SELECT path, ext FROM images WHERE id = ?", [id]);
+    const fp = img?.path ? String(img.path) : resolvePathById(id);
+    if (!fp) return { ok: false, status: "error", error: "图片不存在" };
+    if (String(fp).startsWith("ext:")) return { ok: false, status: "error", error: "外链不能识图（模型只收字节）" };
+    if (!fs.existsSync(fp)) return { ok: false, status: "error", error: "源文件不存在" };
+    const ext = String(img?.ext || path.extname(fp)).replace(/^\./, "").toLowerCase();
+    if (VIDEO_EXTS.has(ext)) return { ok: false, status: "error", error: "视频不支持识图" };
+    if (!sharpLib) return { ok: false, status: "error", error: "sharp 不可用，无法生成预览图" };
+    const max = Math.min(1536, Math.max(256, Number(body.maxSize) || 1024));
+    try {
+      const buf = await sharpLib(fp, { animated: false })
+        .rotate()
+        .resize({ width: max, height: max, fit: "inside", withoutEnlargement: true })
+        .webp({ quality: 82 })
+        .toBuffer();
+      return { ok: true, status: "ok", base64: buf.toString("base64"), mime: "image/webp", bytes: buf.length };
+    } catch (e) {
+      return { ok: false, status: "error", error: `生成预览失败：${String(e?.message || e).slice(0, 160)}` };
+    }
+  },
+
+  /**
+   * 写入识图结果：描述 + 标签。
+   *
+   * 描述进 images.description —— FTS 靠触发器自动跟着走（见 openDb 里的迁移）。
+   * 标签走与 /tags 同一套 upsert，**只新增、不删用户自己打的标签**；
+   * 重复识图会覆写 description（这就是“重跑一次”该有的行为）。
+   */
+  "/describe": async (_req, body) => {
+    const id = String(body.id || "");
+    if (!id) return { ok: false, status: "error", error: "missing id" };
+    if (!q1("SELECT id FROM images WHERE id = ?", [id])) {
+      return { ok: false, status: "error", error: "图片不存在" };
+    }
+    const desc = String(body.description || "").trim().slice(0, 4000);
+    const aiName = String(body.name || "").trim().slice(0, 60);
+    const clear = body.clear === true;   // clear=true：清掉识图结果（描述置 NULL，标签不动）
+    if (!desc && !clear) return { ok: false, status: "error", error: "missing description" };
+    const names = (Array.isArray(body.tags) ? body.tags : [body.tags])
+      .map((s) => String(s || "").trim()).filter(Boolean).slice(0, 24);
+
+    if (clear) {
+      run("UPDATE images SET description = NULL, ai_name = NULL WHERE id = ?", [id]);
+    } else {
+      run("UPDATE images SET description = ? WHERE id = ?", [desc, id]);
+      // name 只在模型真的给了的时候才写 —— 否则会把上一次的好名字冲成空。
+      if (aiName) run("UPDATE images SET ai_name = ? WHERE id = ?", [aiName, id]);
+    }
+    let tagged = 0;
+    for (const name of names) {
+      run("INSERT OR IGNORE INTO tags (name) VALUES (?)", [name]);
+      const t = q1("SELECT id FROM tags WHERE name = ?", [name]);
+      if (t) { run("INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?, ?)", [id, t.id]); tagged++; }
+    }
+    return { ok: true, status: "ok", id, description: clear ? "" : desc, name: clear ? "" : aiName, tags: names, tagged, cleared: clear };
+  },
+
+  /* ── 语义向量 ── */
+
+  /** 候选 + 当前配置 + 已有索引概况（不回传 key，只说有没有）。 */
+  "/embed/sources": async () => {
+    const cfg = readConfig().embed || {};
+    const api = resolveEmbedApi(cfg);
+    const idx = loadVectors(true);
+    return {
+      ok: true,
+      status: "ok",
+      candidates: discoverEmbedCandidates(),
+      config: cfg,
+      resolved: {
+        providerId: String(cfg.providerId || ""),
+        model: api.model || "",
+        baseUrl: api.baseUrl || "",
+        hasKey: !!api.apiKey,
+        // 自定义 key 只在内存里（不落盘），重启后就没了 —— UI 要能把这件事说出来。
+        keyInMemory: !!(cfg.source === "custom" && _embedKeyOverride),
+      },
+      index: idx ? { count: idx.ids.length, dims: idx.dims, model: idx.model } : null,
+    };
+  },
+
+  /** 连一下 /embeddings 确认真能出向量 —— 别等跑完六千张才发现 key 是错的。 */
+  "/embed/test": async (_req, body) => {
+    // body 里带了 key 就顺手记进内存（一次不跑两遍），但**仍然不落盘**。
+    if (body?.apiKey) _embedKeyOverride = String(body.apiKey).trim();
+    const cfg = (body?.providerId || body?.baseUrl || body?.model)
+      ? { ...(readConfig().embed || {}), ...body }
+      : (readConfig().embed || {});
+    const api = resolveEmbedApi(cfg);
+    if (!api.apiKey) return { ok: false, status: "error", error: "拿不到 API key（provider 未配 key，或 source=custom 却没填）" };
+    const t0 = Date.now();
+    const r = await embedTexts(["连接测试"], cfg);
+    if (!r.ok) return { ok: false, status: "error", error: r.error };
+    return { ok: true, status: "ok", dims: r.vectors[0].length, model: api.model, baseUrl: api.baseUrl, ms: Date.now() - t0 };
+  },
+
+  /** 建语义索引（后台跑，UI 轮询 status 看进度）。文本没变的旧向量直接留用。 */
+  "/embed/build/start": async (_req, body) => {
+    if (_embedJob?.running) return { ok: false, status: "error", error: "已经在建索引了" };
+    const cfg = (body?.providerId || body?.model)
+      ? { ...(readConfig().embed || {}), ...body }
+      : (readConfig().embed || {});
+    const api = resolveEmbedApi(cfg);
+    if (!api.apiKey || !api.model) return { ok: false, status: "error", error: "embedding 配置不完整（缺 key 或 model）" };
+    if (typeof fetch !== "function") return { ok: false, status: "error", error: "当前运行时没有 fetch" };
+    runEmbedBuild(cfg).catch((e) => {
+      if (_embedJob) { _embedJob.running = false; _embedJob.error = String(e?.message || e); }
+    });
+    return { ok: true, status: "ok", started: true };
+  },
+
+  "/embed/build/status": async () => {
+    const idx = loadVectors();
+    return {
+      ok: true,
+      status: "ok",
+      job: _embedJob ? { ..._embedJob, cancel: undefined } : null,
+      index: idx ? { count: idx.ids.length, dims: idx.dims, model: idx.model } : null,
+    };
+  },
+
+  "/embed/build/cancel": async () => {
+    if (!_embedJob?.running) return { ok: false, status: "error", error: "没有在跑的建索引任务" };
+    _embedJob.cancel = true;
+    return { ok: true, status: "ok", message: "已请求中止（当前这批跑完就停，已完成的会写盘）" };
+  },
+
+  /** 语义搜索：查词 → 向量 → 余弦 topK → 回图片行（带 tags/media_type，跟 /search 同形状）。 */
+  "/embed/search": async (_req, body) => {
+    const query = String(body.query || "").trim();
+    if (!query) return { ok: false, status: "error", error: "missing query" };
+    const cache = loadVectors();
+    if (!cache?.ids.length) return { ok: false, status: "error", error: "还没有语义索引（先在设置里建一次）" };
+    const t0 = Date.now();
+    const r = await embedTexts([query], readConfig().embed || {});
+    if (!r.ok) return { ok: false, status: "error", error: r.error };
+    const minScore = Number.isFinite(Number(body.minScore)) ? Number(body.minScore) : 0.25;
+    const hits = vectorTopK(r.vectors[0], Number(body.topK) || 60).filter((h) => h.score >= minScore);
+    if (!hits.length) return { ok: true, status: "ok", results: [], total: 0, ms: Date.now() - t0, query };
+    const rows = q(`SELECT id, filename, ext, path, size_bytes, width, height, date_taken, date_imported, thumbnail_path, description, ai_name
+                    FROM images WHERE id IN (${hits.map(() => "?").join(",")})`, hits.map((h) => h.id));
+    const byId = new Map(rows.map((row) => [row.id, row]));
+    const results = [];
+    for (const h of hits) {
+      const row = byId.get(h.id);
+      if (!row) continue;
+      row.tags = q("SELECT t.name FROM tags t JOIN image_tags it ON t.id = it.tag_id WHERE it.image_id = ? ORDER BY t.name", [row.id]).map((x) => x.name);
+      row.media_type = VIDEO_EXTS.has("." + String(row.ext).toLowerCase()) ? "video" : "image";
+      row.source = String(row.path).startsWith("ext:") ? "external" : "import";
+      row.favorited = row.tags.includes(FAVORITE_TAG) ? 1 : 0;
+      row.score = Math.round(h.score * 1000) / 1000;
+      results.push(row);
+    }
+    return { ok: true, status: "ok", results, total: results.length, ms: Date.now() - t0, query };
   },
 
   /** 重命名：改磁盘文件名 + 同步库记录（缩略图不受影响，按 id 缓存）。 */
@@ -1236,29 +2217,64 @@ const routes = {
     return { ok: true };
   },
 
-  /** 生成（并缓存）缩略图，返回 app-data 内的相对路径。sharp 不可用时原样返回原图路径。 */
+  /**
+   * 生成（并缓存）缩略图，**直接回传缩略图字节**。
+   *
+   * 为什么回字节而不是回路径：只有受管服务能读 app-data 之外的文件，HTTP 层拿到
+   * 路径也没法自己读；而「把缩略图路径当成图片 id 再转一次 /image」是查不到记录的
+   * —— 那正是 v0.6.0 里 /thumb 必然 404 的原因（修在 http/ui.js 与这里两处）。
+   *
+   * 缓存 key = 源文件 (size:mtimeMs) 的 sha256 前 20 位，不再依赖 DB uuid。
+   * 这样不入库的三类来源（生成图 / 内置素材 / 媒体库）也能有缩略图 —— 它们没有
+   * uuid，旧实现等于把它们永久排除在缩略图之外。
+   */
   "/thumb": async (_req, body) => {
     const id = String(body.id || "");
-    // 生成图与内置素材不进库，直接回退原图。
-    if (id.startsWith("gen_") || id.startsWith("builtin_") || id.startsWith("medlib_")) return { ok: false, error: "无缩略图", fallbackOriginal: true };
     const img = q1("SELECT id, path, thumbnail_path, ext FROM images WHERE id = ?", [id]);
-    if (!img) return { ok: false, error: "图片不存在" };
-    // 外部链接 / 视频：没有可生成的缩略图，回退到原图（前端再决定怎么展示）。
-    if (String(img.path).startsWith("ext:") || VIDEO_EXTS.has("." + String(img.ext).toLowerCase())) {
-      return { ok: false, error: "无可生成的缩略图", fallbackOriginal: true, originalPath: img.path };
+    // 不入库的三类来源：id 里带前缀，解析回真实文件路径。
+    const srcPath = img ? String(img.path || "") : resolvePathById(id);
+    const ext = img
+      ? String(img.ext || "").toLowerCase()
+      : path.extname(srcPath || "").replace(".", "").toLowerCase();
+
+    if (!srcPath) return { ok: false, error: "图片不存在", fallbackOriginal: true };
+    if (srcPath.startsWith("ext:")) return { ok: false, error: "外链无缩略图", fallbackOriginal: true };
+    // 视频：用 ffmpeg 抽一帧；抽不到就 noFallback —— 回退原图没有意义，
+    // <img> 读不了 mp4，只会白传几十 MB。
+    if (VIDEO_EXTS.has("." + ext)) {
+      if (!ffmpegPath) return { ok: false, error: "未找到 ffmpeg，无法为视频生成缩略图", noFallback: true };
+      const vkey = computeThumbKey(srcPath);
+      const vcache = vkey ? path.join(THUMB_DIR, `${vkey}.webp`) : null;
+      if (vcache && fs.existsSync(vcache)) return readThumbResponse(vcache, { cached: true });
+      const frame = await videoFrame(srcPath, readConfig().thumbnailSize || 300);
+      if (!frame) return { ok: false, error: "视频抽帧失败", noFallback: true, originalPath: srcPath };
+      return readThumbResponse(frame.path, { cached: false, mime: frame.mime });
     }
-    if (img.thumbnail_path && fs.existsSync(img.thumbnail_path)) {
-      return { ok: true, path: img.thumbnail_path, cached: true };
+    if (!fs.existsSync(srcPath)) return { ok: false, error: "源文件不存在", fallbackOriginal: true, originalPath: srcPath };
+    if (!sharpLib) return { ok: false, error: "sharp 不可用", fallbackOriginal: true, originalPath: srcPath };
+
+    // ① 新 key 缓存。先查它而不是先查 legacy：旧 uuid 缓存不随源文件变化，
+    //    「源文件被替换」正是这轮换 key 要修的问题，不能让它继续命中旧图。
+    const key = computeThumbKey(srcPath);
+    const cachePath = key ? path.join(THUMB_DIR, `${key}.webp`) : null;
+    if (cachePath && fs.existsSync(cachePath)) return readThumbResponse(cachePath, { cached: true });
+    // ② legacy 兼容：换 key 之前按 uuid 生成的缩略图仍然可用，别白扔。
+    if (img?.thumbnail_path && fs.existsSync(img.thumbnail_path)) {
+      return readThumbResponse(img.thumbnail_path, { cached: true, legacyKey: true });
     }
-    if (!sharpLib) return { ok: false, error: "sharp 不可用", fallbackOriginal: true, originalPath: img.path };
-    if (!fs.existsSync(img.path)) return { ok: false, error: "源文件不存在" };
 
     const size = readConfig().thumbnailSize || 300;
     fs.mkdirSync(THUMB_DIR, { recursive: true });
-    const outPath = path.join(THUMB_DIR, `${img.id}.webp`);
-    await sharpLib(img.path).rotate().resize(size, size, { fit: "inside", withoutEnlargement: true }).webp({ quality: 82 }).toFile(outPath);
-    run("UPDATE images SET thumbnail_path = ? WHERE id = ?", [outPath, img.id]);
-    return { ok: true, path: outPath, cached: false };
+    const outPath = cachePath || path.join(THUMB_DIR, `${crypto.randomUUID()}.webp`);
+    try {
+      await sharpLib(srcPath).rotate().resize(size, size, { fit: "inside", withoutEnlargement: true })
+        .webp({ quality: 82 }).toFile(outPath);
+    } catch (e) {
+      return { ok: false, error: `缩略图生成失败：${String(e?.message || e).slice(0, 120)}`, fallbackOriginal: true, originalPath: srcPath };
+    }
+    // 只有入库条目才有 thumbnail_path 可写；三类外部来源走 key 缓存命中。
+    if (img) run("UPDATE images SET thumbnail_path = ? WHERE id = ?", [outPath, img.id]);
+    return readThumbResponse(outPath, { cached: false });
   },
 
   /**
@@ -1273,9 +2289,8 @@ const routes = {
         : id.startsWith("builtin_") ? resolveBuiltinPath(id) : resolveMediaLibPath(id);
       if (!fp || !fs.existsSync(fp)) return { ok: false, error: "文件不存在" };
       const st = fs.statSync(fp);
-      if (st.size > MAX_IMAGE_BYTES) {
-        return { ok: false, error: "文件超过回传上限", tooLarge: true, size: st.size, limit: MAX_IMAGE_BYTES };
-      }
+      const extOf = path.extname(fp).toLowerCase().replace(".", "");
+      if (st.size > MAX_IMAGE_BYTES) return oversizedImageResponse(fp, st, VIDEO_EXTS.has("." + extOf));
       const ext = path.extname(fp).toLowerCase().replace(".", "");
       return { ok: true, mime: MIME[ext] || "application/octet-stream", base64: fs.readFileSync(fp).toString("base64") };
     }
@@ -1288,7 +2303,7 @@ const routes = {
     if (!fs.existsSync(img.path)) return { ok: false, error: "源文件不存在" };
     const st = fs.statSync(img.path);
     if (st.size > MAX_IMAGE_BYTES) {
-      return { ok: false, error: "图片超过回传上限", tooLarge: true, size: st.size, limit: MAX_IMAGE_BYTES };
+      return oversizedImageResponse(img.path, st, VIDEO_EXTS.has("." + String(img.ext).toLowerCase()));
     }
     const ext = String(img.ext).toLowerCase();
     return { ok: true, mime: MIME[ext] || "application/octet-stream", base64: fs.readFileSync(img.path).toString("base64") };
@@ -1304,6 +2319,63 @@ const routes = {
       run("DELETE FROM images WHERE id = ?", [id]);
     }
     return { ok: true, removed: ids.length };
+  },
+
+  /**
+   * 用系统默认程序打开（视频 → 默认播放器，图片 → 默认看图器）。
+   *
+   * 为什么不在 App 内播放：受管服务只能把文件字节 base64 回传，受 MAX_IMAGE_BYTES
+   * 限制（卡在宿主 4MB 响应上限内）—— 拿它做视频流是错的。几十 MB 的片子交给
+   * 系统播放器，既不占内存也不卡界面。
+   *
+   * 安全：只收 id，路径完全由服务端解析。客户端传路径进来的口子一个不能开。
+   */
+  "/open": async (_req, body) => {
+    const id = String(body.id || "");
+    const img = q1("SELECT path FROM images WHERE id = ?", [id]);
+    const fp = img ? String(img.path || "") : resolvePathById(id);
+    if (!fp) return { ok: false, error: "图片不存在" };
+    if (fp.startsWith("ext:")) return { ok: false, error: "外链请直接打开链接", external: true, url: fp.slice(4) };
+    if (!fs.existsSync(fp)) return { ok: false, error: "源文件不存在" };
+    const r = openWithSystemDefault(fp);
+    return r.ok
+      ? { ok: true, status: "ok", opened: path.basename(fp), via: r.via, code: r.code }
+      : { ok: false, error: r.error };
+  },
+
+  /**
+   * 在系统文件管理器中定位文件（打开所在文件夹并选中）。同样只收 id。
+   * 这是 QQ 留言里「图库还需要能直接打开图片和视频所在的文件夹」那条。
+   */
+  "/reveal": async (_req, body) => {
+    const id = String(body.id || "");
+    const img = q1("SELECT path FROM images WHERE id = ?", [id]);
+    const fp = img ? String(img.path || "") : resolvePathById(id);
+    if (!fp) return { ok: false, error: "图片不存在" };
+    if (fp.startsWith("ext:")) return { ok: false, error: "外链没有本地文件夹" };
+    if (!fs.existsSync(fp)) return { ok: false, error: "源文件不存在" };
+    const r = revealInExplorer(fp);
+    // mode/focused 要传回前端：前端靠 focused 决定说「已置前」还是「得 Alt+Tab」。
+    return r.ok
+      ? { ok: true, status: "ok", via: r.via, mode: r.mode || "", focused: !!r.focused, detail: r.detail || "" }
+      : { ok: false, error: r.error };
+  },
+
+  /**
+   * 目录列表（文件夹维度）。
+   * 不入库的三类来源不算 —— 它们不属于用户的图片目录结构。
+   */
+  "/folders": async () => {
+    const rows = q("SELECT path FROM images WHERE hidden = 0 AND path NOT LIKE 'ext:%'");
+    const map = new Map();
+    for (const r of rows) {
+      const d = path.dirname(String(r.path));
+      map.set(d, (map.get(d) || 0) + 1);
+    }
+    const folders = [...map.entries()]
+      .map(([dir, count]) => ({ dir, count }))
+      .sort((a, b) => b.count - a.count || a.dir.localeCompare(b.dir));
+    return { ok: true, status: "ok", folders, total: folders.length };
   },
 
   "/db/rebuild": async () => {    const d = openDb();

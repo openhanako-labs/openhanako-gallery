@@ -344,6 +344,35 @@ button { cursor: pointer; border: 0; background: transparent; }
 }
 .tag-all { font-weight: 500; }
 .tag-all.active { font-weight: 600; }
+/* 标签栏的展开/收起开关。它不是筛选条件，所以做的最轻：只给虚线，不抢注意力。 */
+.tag-more {
+  border: 1px dashed var(--g-divider);
+  color: var(--g-ter);
+  cursor: pointer;
+  font-size: 11px;
+}
+.tag-more:hover { border-style: solid; background: var(--g-hover); color: var(--g-text); }
+/* 批量命名的确认条：动盘之前先把数字与样例摆出来。 */
+.selbar-confirm {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 12px;
+  background: var(--g-warn-bg);
+  color: var(--g-warn);
+  font-size: 11.5px;
+  line-height: 1.6;
+  border-bottom: 1px solid var(--g-divider);
+}
+.selbar-confirm[hidden] { display: none; }
+
+/* 可拖动排序的标签：拉起来时给点反馈，拖到谁身上谁就亮一个插入位。 */
+.tag[draggable="true"] { cursor: grab; }
+.tag.dragging { opacity: .45; cursor: grabbing; }
+.tag.drop-target {
+  box-shadow: -2px 0 0 0 var(--g-accent);
+  background: var(--g-hover);
+}
 .tag b {
   font-family: var(--g-mono);
   font-size: 10px;
@@ -411,6 +440,25 @@ button { cursor: pointer; border: 0; background: transparent; }
   overflow: hidden;
   background: #e8e0d2;
 }
+
+/* 缩略图降级占位。
+   触发：缩略图生成失败 / 源文件已移走 / 视频无缩略图。
+   以前这些情况会让 <img> 退化成 alt 文字（即文件名），看着像一条空记录。 */
+.card .thumb-fallback {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 3px;
+  color: #9a9083;
+  background: repeating-linear-gradient(45deg, #efe8db 0 6px, #e8e0d2 6px 12px);
+}
+.card .thumb-fallback .ic { font-size: 15px; opacity: .55; }
+.card .thumb-fallback .tx { font-size: 10.5px; letter-spacing: .02em; }
+.card .thumb-fallback .ex { font-size: 9.5px; opacity: .7; font-family: ui-monospace, Consolas, monospace; }
+
 .card .thumb img,
 .card .thumb video {
   width: 100%;
@@ -520,6 +568,59 @@ button { cursor: pointer; border: 0; background: transparent; }
   color: var(--g-ter);
 }
 
+/* 批量选择条：只在多选模式下出现，位置在标签栏与网格之间。 */
+.selbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 14px;
+  background: var(--g-bar);
+  border-bottom: 1px solid var(--g-divider-soft);
+}
+.selbar.is-hidden { display: none; }
+.selbar-input {
+  height: var(--g-ctl-h);
+  width: 200px;
+  max-width: 34vw;
+  padding: 0 9px;
+  border: 1px solid var(--g-divider);
+  border-radius: var(--g-radius);
+  background: #fff;
+  color: var(--g-text);
+  font-size: 12px;
+  outline: none;
+}
+.selbar-input:focus { border-color: var(--g-accent); }
+.selbar-count {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+  color: var(--g-sec);
+  margin-right: 4px;
+}
+
+/* 多选模式下的勾选框。放在缩略图左上角，与来源角标错开一点。 */
+.card .selbox {
+  position: absolute;
+  top: 7px;
+  right: 7px;
+  z-index: 3;
+  width: 19px;
+  height: 19px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  line-height: 1;
+  color: #fff;
+  background: rgb(32 25 18 / 46%);
+  border: 1px solid rgb(255 255 255 / 72%);
+  border-radius: 5px;
+}
+.card .selbox.on { background: var(--g-accent); border-color: var(--g-accent); }
+.card.sel { outline: 2px solid var(--g-accent); outline-offset: -2px; }
+.card.sel .thumb img { opacity: .84; }
+
 /* ═══════ 8. 预览弹窗 ═══════ */
 .modal {
   display: none;
@@ -550,17 +651,52 @@ button { cursor: pointer; border: 0; background: transparent; }
 }
 .modal.show .modal-content { transform: scale(1) translateY(0); opacity: 1; }
 
-.modal-content img,
-.modal-content video {
+/* 媒体尺寸规则已下沉到 .modal-stage（见下）—— 旧的 .modal-content img 规则删掉，
+   避免两套 max-width/max-height 互相覆盖。 */
+
+/* 媒体舞台：把放大后的图裁在自己的盒子里。
+   为什么必须有这一层：图是靠 transform: scale() 放大的，而 transform **不参与布局**
+   —— 没有 overflow:hidden 的容器裁掉溢出，放大的图就会盖住下面的工具条与信息框。 */
+.modal-stage {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  overflow: hidden;
+  min-width: 320px;
+  min-height: 220px;
+  background: #efe8db;
+  touch-action: none;
+}
+.modal-stage img,
+.modal-stage video {
   max-width: 88vw;
   max-height: 72vh;
   object-fit: contain;
   display: block;
   background: #efe8db;
   cursor: zoom-in;
+  transform-origin: center center;
   transition: transform .18s ease;
+  will-change: transform;
 }
-.modal-content img.zoomed { cursor: zoom-out; }
+.modal-stage img.zoomed { cursor: grab; }
+.modal-stage img.dragging { cursor: grabbing; transition: none; }
+
+/* 全屏查看：媒体吃满视口，工具条留在底部，信息框收起。
+   退出三条路：同一个按钮 / Esc / 点遮罩关闭。 */
+.modal.fullscreen .modal-content {
+  width: 100vw;
+  height: 100vh;
+  max-width: 100vw;
+  max-height: 100vh;
+  border-radius: 0;
+  transform: none;
+}
+.modal.fullscreen .modal-stage { flex: 1; max-width: 100vw; max-height: none; }
+.modal.fullscreen .modal-stage img,
+.modal.fullscreen .modal-stage video { max-width: 100vw; max-height: calc(100vh - 46px); }
+.modal.fullscreen .modal-info { display: none; }
 
 .zoom-bar {
   display: flex;
@@ -611,6 +747,17 @@ button { cursor: pointer; border: 0; background: transparent; }
   word-break: break-all;
   line-height: 1.5;
 }
+
+/* 路径行：路径 + 「所在文件夹」按钮同一行。按钮放在这里而不是工具条里，
+   因为它是「对当前路径」的动作，语义上就属于路径那一行。 */
+.modal-pathrow {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 3px;
+}
+.modal-pathrow code.path { flex: 1; min-width: 0; background: none; padding: 0; margin: 0; }
+.modal-pathrow .modal-btn { flex: 0 0 auto; height: 24px; font-size: 11px; padding: 0 9px; }
 .modal-info .detail-row {
   display: flex;
   gap: 14px;
@@ -814,6 +961,46 @@ button { cursor: pointer; border: 0; background: transparent; }
 .status-msg.info    { display: block; background: var(--g-warn-bg); color: var(--g-warn); }
 .status-msg.success { display: block; background: var(--g-success-bg); color: var(--g-success); }
 .status-msg.error   { display: block; background: var(--g-danger-bg); color: var(--g-danger); }
+
+/* 悬浮消息气泡（showMsg 用）。
+   为什么必须挂在 body 上：旧的 #statusMsg 在设置抽屉里，抽屉关着就 display:none，
+   在弹窗里又被 .modal(z-index:100) 盖住 —— 反馈等于不存在。
+   z-index 取 999，高过弹窗(100/101)与设置抽屉(200/201)。 */
+.toast {
+  position: fixed;
+  left: 50%;
+  bottom: 26px;
+  z-index: 999;
+  max-width: 76vw;
+  padding: 9px 14px;
+  border-radius: 9px;
+  font-size: 12.5px;
+  line-height: 1.5;
+  box-shadow: 0 8px 24px rgb(60 45 25 / 18%);
+  opacity: 0;
+  transform: translateX(-50%) translateY(8px);
+  pointer-events: none;
+  transition: opacity .18s ease, transform .18s ease;
+}
+.toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+.toast.info    { background: var(--g-warn-bg); color: var(--g-warn); }
+.toast.success { background: var(--g-success-bg); color: var(--g-success); }
+.toast.error   { background: var(--g-danger-bg); color: var(--g-danger); }
+
+/* 模型写的图片描述（识图产物）。比标签重、比正文轻。 */
+.modal-desc {
+  margin-top: 8px;
+  padding: 8px 10px;
+  border-radius: 7px;
+  background: var(--g-raised);
+  border: 1px solid var(--g-divider);
+  color: var(--g-sec);
+  font-size: 12px;
+  line-height: 1.65;
+  text-align: left;
+  max-height: 88px;
+  overflow-y: auto;
+}
 
 /* ═══════ 10. 确认删除 ═══════ */
 #deleteModal {
