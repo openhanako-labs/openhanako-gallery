@@ -90,7 +90,7 @@
     <button class="modal-btn" type="button" onclick="batchUntag()" title="用同一个输入框里的标签名，从选中的图上一并去掉">🏷 去标签</button>
     <button class="modal-btn" type="button" id="aiBatchBtn" onclick="batchAiDescribe()" title="用视觉模型给选中的图逐张生成描述与标签">✨ 识图打标</button>
     <button class="modal-btn" type="button" onclick="batchReveal()">📂 打开首个所在文件夹</button>
-    <button class="modal-btn" type="button" onclick="batchRename()" id="selRenameBtn" title="按识图结果把文件名改成「日期_关键词」（只改名字，不移动位置）">✨ 批量命名</button>
+    <button class="modal-btn" type="button" onclick="batchRename()" id="selRenameBtn" title="把文件名改成识图给出的语义短名（如「图书馆学生合影」；只改名字，不移动位置）">✨ 批量命名</button>
     <button class="modal-btn danger" type="button" onclick="batchDelete()">批量删除</button>
     <button class="modal-btn" type="button" onclick="clearSel()">清空</button>
     <button class="modal-btn" type="button" onclick="toggleSelMode()">退出多选</button>
@@ -147,7 +147,7 @@
       <div class="modal-actions" id="modalActions">
         <input type="text" id="renameInput" placeholder="重命名…" class="rename-input">
         <button class="modal-btn" type="button" onclick="renameImage()" title="应用重命名">✏️ 改名</button>
-        <button class="modal-btn" type="button" onclick="aiSuggestName()" title="按日期+原名生成建议">✨ 命名</button>
+        <button class="modal-btn" type="button" onclick="aiSuggestName()" title="用识图结果生成建议名（如「图书馆学生合影」），先填进改名框">✨ 命名</button>
         <button class="modal-btn" type="button" onclick="showGroupPanel()" title="添加标签">📁 分组</button>
         <button class="modal-btn danger" type="button" onclick="deleteImage()">删除</button>
       </div>
@@ -206,7 +206,7 @@
       <h3>识图模型（看图打标签用）</h3>
       <label style="display:flex;align-items:center;gap:6px;font-size:11.5px;color:#6a5a4a;margin:6px 0 2px">
         <input type="checkbox" id="cfgAiRename" onchange="saveAiRename(this.checked)">
-        识图后自动改文件名（格式：日期_关键词）
+        识图后自动改文件名（用模型给的语义短名）
       </label>
       <div style="font-size:11px;color:#a39781;line-height:1.6;margin-bottom:4px">关着也不浪费：识图后会把建议名填进改名框，你看一眼点「✏️ 改名」就行。开了就真的改磁盘文件名（只改名字，不移动位置）。</div>
       <select class="sort-select" id="cfgAiModel" style="width:100%" onchange="saveAiModel(this.value)">

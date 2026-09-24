@@ -769,7 +769,7 @@
   }
 
   /**
-   * 批量命名：按识图结果把选中的图改成「日期_关键词」。
+   * 批量命名：把选中的图改成识图给出的语义短名（如「图书馆学生合影」）。
    *
    * 两步走（这一步只是**预览与统计**，不动任何文件）：
    *   · 只处理有识图结果的（有标签或描述）
@@ -1365,7 +1365,7 @@
         method: "POST", headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ aiRenameOnDescribe: _autoRename }),
       });
-      showMsg(_autoRename ? "已开启：识图后会自动改名（格式 日期_关键词）" : "已关闭：识图后只把建议名填进改名框", "info");
+      showMsg(_autoRename ? "已开启：识图后会自动改名（用模型给的语义短名）" : "已关闭：识图后只把建议名填进改名框", "info");
     } catch (e) {
       showMsg("保存失败: " + e.message, "error");
     }
