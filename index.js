@@ -78,15 +78,22 @@ export async function apply(ctx) {
 
   // 首次装载存在「权限记账尚未落盘」的窗口，启动可能被拒；runtime-host 会在
   // 第一次真调用时自愈重试，所以这里失败不当作终态。
-  const ready = await startService(ctx, { dataDir, log });
-  if (ready) {
-    try { fs.writeFileSync(stampFile, stamp); } catch { /* ignore */ }
-    log.info(`${APP_ID} ready`);
-  } else {
-    log.warn(`${APP_ID} 已加载，图库服务暂不可用 —— 首次调用时会自动重试`, {
-      hint: "需要 app/runtime.execute + app/runtime.local-machine 授权（设置 → 安全 → 应用能力）。",
-    });
-  }
+  //
+  // **不 await**：窗口不该为了等一个受管子进程就白转圈。apply 立刻返回，
+  // 卡片外壳马上出来，面板自己的「加载中…」接管；服务起来之前第一个真请求
+  // 会走 callService 的自愈路径（那条路本来就在），该等的地方等，而不是整页等。
+  startService(ctx, { dataDir, log })
+    .then((ready) => {
+      if (ready) {
+        try { fs.writeFileSync(stampFile, stamp); } catch { /* ignore */ }
+        log.info(`${APP_ID} ready`);
+      } else {
+        log.warn(`${APP_ID} 已加载，图库服务暂不可用 —— 首次调用时会自动重试`, {
+          hint: "需要 app/runtime.execute + app/runtime.local-machine 授权（设置 → 安全 → 应用能力）。",
+        });
+      }
+    })
+    .catch((e) => log.error("图库服务启动异常", { error: e?.message || String(e) }));
 
   return () => {
     for (const off of disposers) {

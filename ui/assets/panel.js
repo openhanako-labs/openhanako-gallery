@@ -986,7 +986,19 @@
       .then(function (d) {
         if (d.status === "ok" || d.ok) {
           closeModal();
-          showMsg((alsoFile ? "已删除（含磁盘文件）" : "已从图库移除") + "：" + (d.removed || ids.length) + " 张", "success");
+          // 「库删了、磁盘没删掉」必须说出来。以前无论磁盘删没删都报
+          // 「已删除（含磁盘文件）」，于是文件还在文件夹里、界面却报成功。
+          var failed = (d.errors || []).length;
+          var n = d.removed || ids.length;
+          if (alsoFile && failed) {
+            var why = (d.errors[0] && d.errors[0].error) || "文件被占用";
+            showMsg("库记录已删 " + n + " 张，但磁盘文件还有 " + failed + " 个没删掉（" + why
+              + "）。文件留着的话点「重新扫描」可以重新入库。", "error", 12000);
+          } else if (alsoFile) {
+            showMsg("已删除（含磁盘文件）：" + n + " 张", "success");
+          } else {
+            showMsg("已从图库移除：" + n + " 张（磁盘文件没动）", "success");
+          }
           if (selMode) clearSel();
           load();
         } else showMsg("失败: " + (d.error || ""), "error");
@@ -1589,7 +1601,7 @@
    * 改成挂在 body 上的悬浮气泡，z-index 高过弹窗与设置抽屉。
    */
   var _toastEl = null, _toastTimer = null;
-  function showMsg(text, type) {
+  function showMsg(text, type, ms) {
     if (!_toastEl) {
       _toastEl = document.createElement("div");
       _toastEl.className = "toast";
@@ -1598,7 +1610,7 @@
     _toastEl.className = "toast " + (type || "info") + " show";
     _toastEl.textContent = text;
     clearTimeout(_toastTimer);
-    _toastTimer = setTimeout(function () { _toastEl.classList.remove("show"); }, 4200);
+    _toastTimer = setTimeout(function () { _toastEl.classList.remove("show"); }, ms || 4200);
   }
 
   async function saveConfig() {
@@ -1654,7 +1666,8 @@
         method: "POST", headers: { "Content-Type": "application/json" },
         // 不传 paths：让服务端用它的默认目录集（scanPaths ∪ galleryRoot），
         // 否则从 UI 进来会将 galleryRoot 排除在外，放进根目录的图永远扫不到。
-        body: JSON.stringify({ showVideo: true }),
+        // force：这是用户主动点的，不要被服务端的 60s 自动节流拦下来。
+        body: JSON.stringify({ showVideo: true, force: true }),
       });
       var d = await r.json();
       var s = d.summary || d;
@@ -1906,6 +1919,8 @@
     try { last = Number(sessionStorage.getItem(KEY) || 0); } catch (e) { /* 隐私模式 */ }
     if (Date.now() - last < 60000) return;
     try { sessionStorage.setItem(KEY, String(Date.now())); } catch (e) { /* 忽略 */ }
+    // 不带 force：服务端自己也有一道全局节流（60s）。本地这道是按窗口的，
+    // 新窗口永远为空 —— 真正拦住重复扫描的是服务端那道。
     apiFetch("/import", {
       method: "POST", headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ showVideo: true }),

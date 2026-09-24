@@ -2,10 +2,10 @@
   "manifestVersion": 2,
   "id": "hanako-gallery",
   "name": "Hanako Gallery",
-  "version": "0.7.0",
+  "version": "0.7.1",
   "description": "图库管理：目录导入、EXIF 索引、标签、缩略图、全文检索、Markdown 引用。图片本体留在原目录，索引与缩略图存应用数据目录。",
   "entry": "index.js",
-  "icon": "assets/icon.svg",
+  "icon": "assets/icon.png",
   "minAppVersion": "0.928.0",
   "trust": "full-access",
   "capabilities": [
@@ -25,7 +25,7 @@
         "description": "浏览、搜索与管理本地图片库；支持标签、日期筛选与 Markdown 引用生成。",
         "route": "/panel.html",
         "cardForm": "flush",
-        "face": { "image": "face.svg" }
+        "face": { "image": "assets/panel-cover.webp" }
       }
     ]
   }

@@ -237,7 +237,9 @@ export default function (app, ctx) {
   app.post("/import", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     const paths = Array.isArray(body.paths) ? body.paths : (body.path ? [body.path] : []);
-    return c.json(await callService("/scan", { paths, showVideo: body.showVideo === true }));
+    // force 要透传：服务端用它区分「用户主动导入」与「面板开屏自动刷新」——
+    // 后者会被 60s 全局节流拦住，前者不会。漏传的话手动导入会莫名没反应。
+    return c.json(await callService("/scan", { paths, showVideo: body.showVideo === true, force: body.force === true }));
   });
 
   app.post("/rebuild", async (c) => {

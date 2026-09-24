@@ -5,6 +5,21 @@
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title>Hanako Gallery</title>
 <link rel="stylesheet" href="./assets/panel.css">
+<!--
+  告诉宿主「这个页面起来了」。
+
+  宿主的开窗遮罩不会自己消失：它一直等到收到这条消息，或者撑满一个写死的
+  5 秒超时（宿主渲染层里 Es = 5e3，收到 ready 就 clearTimeout）。
+  面板从前一封信都没往宿主发过 —— 于是每次打开都白等那 5 秒，
+  跟库里有几张图、接口多快毫无关系。
+
+  放在样式之后：此时 CSS 已加载，不会闪一屏未样式化的内容。
+-->
+<script>
+(function () {
+  try { (window.parent || window).postMessage({ type: "ready" }, "*"); } catch (e) { /* 不在 iframe 里就算了 */ }
+})();
+</script>
 </head>
 <body>
 <div class="layout">

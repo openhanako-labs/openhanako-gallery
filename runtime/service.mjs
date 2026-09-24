@@ -462,6 +462,14 @@ try {
   sharpLib = r.mod.default ?? r.mod;
   capabilities.sharp = true;
   capabilities.sharpSource = r.source;
+  // 关掉 libvips 的 operation cache。
+  //
+  // 不是性能洁癖，是「删不掉」的元凶：cache 打开时 sharp(path) 会把源文件的 fd
+  // 一直攥在手里（libvips 惰性 mmap），Windows 上就等于文件被占用 ——
+  // 于是「看着这张图 → 勾选连磁盘文件一起删」必然 EBUSY，因为刚为它生成过缩略图。
+  // 关掉之后每次操作结束就松手（实测：path 进 sharp 也能立刻 unlink）。
+  // 本应用的缩略图本来就落在 THUMB_DIR，不指望这个 cache。
+  try { sharpLib.cache(false); } catch { /* 老版本没有这个 API，忽略 */ }
 } catch (e) {
   capabilities.sharpError = String(e?.message || e).slice(0, 200);
 }
@@ -717,6 +725,32 @@ function hashFile(file) {
   const h = crypto.createHash("sha256");
   h.update(fs.readFileSync(file));
   return h.digest("hex");
+}
+
+/**
+ * 删磁盘文件，占用类错误重试几轮。
+ *
+ * Windows 上「文件被占用」是常态而不是异常：缩略图刚生成完、杀软正在扫、
+ * 资源管理器的预览窗格、刚才那次 sharp 读过它 —— 都是几百毫秒级的占用。
+ * 早先的实现只有一次 unlinkSync + 一个空 catch，于是失败得无声无息：
+ * 库里记录没了、磁盘文件还在，前端还报「已删除（含磁盘文件）」。
+ *
+ * 现在：短暂占用退避重试；重试还不行就把真实原因带回去（绝不吞）。
+ * ENOENT 视为成功 —— 目的就是「让它不在」，它已经不在。
+ */
+async function unlinkWithRetry(file, tries = 4) {
+  let last = "";
+  for (let i = 0; i < tries; i++) {
+    try { fs.unlinkSync(file); return { ok: true }; }
+    catch (e) {
+      if (e.code === "ENOENT") return { ok: true };
+      last = `${e.code || ""}: ${e.message}`.replace(/^:\s*/, "").trim();
+      // 只对「可能马上就好」的错误重试；路径非法之类重试没意义。
+      if (!["EBUSY", "EPERM", "EACCES", "EMFILE", "ENFILE"].includes(e.code)) break;
+      await new Promise((r) => setTimeout(r, 150 * (i + 1)));
+    }
+  }
+  return { ok: false, error: last };
 }
 
 /**
@@ -1433,6 +1467,21 @@ ${sections || '  <div class="empty">没有匹配的图片。</div>'}
 `;
 }
 
+/**
+ * 增量扫描的全局节流。
+ *
+ * 面板每次打开都会在 800ms 后自动来一次「增量刷新」，落在 /scan 的默认目录上。
+ * 早先的节流写在前端 sessionStorage 里 —— 而**每个新窗口的 sessionStorage 都是空的**，
+ * 于是「每次打开都跑一遍」。6000 张的库一次 0.7s；几万张就是几秒到几十秒，
+ * 而且扫描是同步 IO，跑起来整段压住服务，面板首屏的缩略图就全排在后面。
+ * 放到服务端才是对的：它知道“刚扫过”，而且是全局的。
+ */
+const SCAN_THROTTLE_MS = 60000;
+let lastScanAt = 0;
+
+/** 扫描循环里每处理多少个文件就让出一次事件循环（见 /scan）。 */
+const SCAN_YIELD_EVERY = 200;
+
 const routes = {
   /** 环境与能力探测。UI 首屏据此决定是否提示"缩略图降级"。 */
   "/status": async () => ({
@@ -1558,6 +1607,20 @@ const routes = {
     const walkStats = { videosSkipped: 0 };
     const errors = [];
 
+    // 全局节流：不带显式路径的扫描就是「面板自己来刷新的那种」，刚扫过就直接跳过。
+    // 显式路径（工具调用 / 用户手输目录）不节流 —— 那是真有人要看结果；force 同理。
+    if (!explicit.length && body.force !== true && Date.now() - lastScanAt < SCAN_THROTTLE_MS) {
+      return {
+        ok: true, status: "ok", skipped: true,
+        reason: "刚扫过",
+        sinceLastScanMs: Date.now() - lastScanAt,
+        summary: { scanned: 0, imported: 0, updated: 0, skipped: 0, failed: 0, videosSkipped: 0, duration_ms: Date.now() - started, targets },
+        errors: [],
+      };
+    }
+    // 先占位：两个请求同时进来时不会双双开扫。
+    lastScanAt = Date.now();
+
     // 增量：先把「路径 → 已知记录」整表读进内存，用于零成本跳过未变文件。
     // 旧实现对每个文件都 hashFile —— 6004 张的库每次扫描要把整个库读一遍，
     // 所以「面板一打开就自动刷新」在旧实现下根本不可行。
@@ -1570,7 +1633,18 @@ const routes = {
       if (!fs.existsSync(target)) { errors.push({ path: target, error: "目录不存在" }); continue; }
       const files = walkImages(target, 200000, body.showVideo === true, walkStats);
       scanned += files.length;
+      let sinceYield = 0;
       for (const file of files) {
+        // 每 200 个文件把事件循环让出去一次。
+        //
+        // 这一段是同步 IO（statSync / readFileSync），而它正好跑在「面板首屏刚渲染完、
+        // 缩略图正一张张进来」的时间窗里 —— 不让出的话所有 HTTP 请求整段排在它后面，
+        // 用户看到的就是「打开图库要转圈好久」。让出去以后扫描总时长几乎不变，
+        // 但中间的空档足够把缩略图和搜索伺候完。
+        if (++sinceYield >= SCAN_YIELD_EVERY) {
+          sinceYield = 0;
+          await new Promise((r) => setImmediate(r));
+        }
         try {
           const st = fs.statSync(file);
           const prev = known.get(file);
@@ -2096,25 +2170,30 @@ const routes = {
   /**
    * 删除。默认只删库记录（不动磁盘，与 /forget 一致）；
    * 传 deleteFile: true 时连磁盘文件一起删。
+   *
+   * 返回值里 filesRequested / filesDeleted 要能对得上：调用方（面板）必须
+   * 能区分「都删了」和「库里删了、磁盘没删掉」，否则用户看到的是假成功。
    */
   "/delete": async (_req, body) => {
     const ids = Array.isArray(body.ids) ? body.ids : [body.id].filter(Boolean);
     if (!ids.length) return { ok: false, status: "error", error: "missing id" };
-    let removed = 0, filesDeleted = 0;
+    let removed = 0, filesDeleted = 0, filesRequested = 0;
     const errors = [];
     for (const id of ids) {
       const img = q1("SELECT id, path, thumbnail_path FROM images WHERE id = ?", [id]);
       if (!img) continue;
       if (body.deleteFile === true && img.path && !String(img.path).startsWith("ext:")) {
-        try { fs.unlinkSync(img.path); filesDeleted++; }
-        catch (e) { errors.push({ id, error: String(e.message).slice(0, 120) }); }
+        filesRequested++;
+        const r = await unlinkWithRetry(img.path);
+        if (r.ok) filesDeleted++;
+        else errors.push({ id, filename: img.filename || "", path: img.path, error: r.error });
       }
       if (img.thumbnail_path) { try { fs.unlinkSync(img.thumbnail_path); } catch { /* 已不存在 */ } }
       run("DELETE FROM image_tags WHERE image_id = ?", [id]);
       run("DELETE FROM images WHERE id = ?", [id]);
       removed++;
     }
-    return { ok: true, status: "ok", removed, filesDeleted, errors };
+    return { ok: true, status: "ok", removed, filesRequested, filesDeleted, errors };
   },
 
   /** 从 URL 下载图片入库。文件名取 URL 末段，冲突时加序号。 */
