@@ -301,6 +301,17 @@
   </div>
 </div>
 
+<!-- ═══ 确认删除标签 ═══ -->
+<div class="modal" id="tagDeleteModal" onclick="if(event.target===this)closeTagDeleteModal()">
+  <div class="modal-confirm">
+    <p id="tagDeleteText">删除这个标签？</p>
+    <div>
+      <button class="modal-btn" type="button" onclick="closeTagDeleteModal()">取消</button>
+      <button class="modal-btn danger" type="button" onclick="confirmDeleteTag()">删除标签</button>
+    </div>
+  </div>
+</div>
+
 <script type="module" src="./assets/panel.js"></script>
 </body>
 </html>

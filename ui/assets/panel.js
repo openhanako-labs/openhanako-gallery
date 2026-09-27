@@ -226,6 +226,17 @@
       var el = document.createElement("span");
       el.className = "tag" + (currentTag === t.name && currentSource === "" ? " active" : "");
       el.innerHTML = esc(t.name) + (t.image_count ? ' <b>' + t.image_count + '</b>' : '');
+      // 悬停出现 ×：整条删除标签（从所有图片上摘掉 + 删标签行本身）。
+      // 放在标签栏而不是详情弹窗里，是因为那边那个 × 只从这一张图上摘，
+      // 两者是不同的动作，界面得让它们待在不同的地方。
+      var x = document.createElement("b");
+      x.className = "tag-x";
+      x.textContent = "×";
+      x.title = "删除标签「" + t.name + "」（所有图片上都会移除）";
+      x.onclick = function (e) { e.stopPropagation(); askDeleteTag(t.name, t.image_count || 0); };
+      // 拖动排序挂在父元素上，不挡 mousedown 的话按下 × 会变成拖拽起点。
+      x.onmousedown = function (e) { e.stopPropagation(); };
+      el.appendChild(x);
       el.onclick = function () { filterTag(t.name); };
       attachTagDrag(el, t.name);
       bar.appendChild(el);
@@ -310,8 +321,63 @@
     }).catch(function () { showMsg("标签顺序没保存成功，下次打开会复原", "error"); });
   }
 
+  /* ── 从标签栏整条删除标签 ─────────────────────────── */
+  // 与详情弹窗里那个 × 不同：那个只从这一张图上摘，这个连标签行一起删。
+  // 一次可能牵连上千张图且不可撤销，所以先弹确认，并把张数摆在面前。
+  var _tagToDelete = null;
+
+  function askDeleteTag(name, count) {
+    _tagToDelete = name;
+    var p = document.getElementById("tagDeleteText");
+    if (p) {
+      p.textContent = "删除标签「" + name + "」？"
+        + (count ? " 它正用在 " + count + " 张图片上，这些图片会失去这个标签。" : "")
+        + " 图片本身不受影响，但此操作不可撤销。";
+    }
+    var m = document.getElementById("tagDeleteModal");
+    if (m) m.classList.add("show");
+  }
+
+  function closeTagDeleteModal() {
+    var m = document.getElementById("tagDeleteModal");
+    if (m) m.classList.remove("show");
+    _tagToDelete = null;
+  }
+
+  async function confirmDeleteTag() {
+    var name = _tagToDelete;
+    closeTagDeleteModal();
+    if (!name) return;
+    try {
+      var r = await apiFetch("/tags/delete", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name: name }),
+      });
+      var d = await r.json();
+      if (!d.ok) return showMsg("删除失败: " + (d.message || d.error || d.code || "未知原因"), "error");
+      showMsg("已删除标签「" + name + "」（同时移除 " + (d.removedLinks || 0) + " 张图上的关联）", "success");
+      // 正筛着这个标签就退回「全部」，否则会停在一个已经不存在的筛选上。
+      if (currentTag === name) { currentTag = ""; _page = 1; }
+      await load();
+    } catch (e) { showMsg("删除出错: " + e.message, "error"); }
+  }
+
   function filterTag(tag) { currentSource = ""; currentUncategorized = false; currentTag = tag; _page = 1; _modalIdx = -1; load(); }
   function filterSource(src) { currentTag = ""; currentUncategorized = false; currentSource = src; _page = 1; _modalIdx = -1; load(); }
+
+  /*
+   * 筛选矩阵（写下来，免得下个改 UI 的人又去猜）：
+   *
+   *   互斥：source ⇄ tag、source ⇄ uncat、source ⇄ folder
+   *         —— 三个外部来源不入库，标签/未分类/目录对它们无意义，切来源时清掉。
+   *   叠加：tag ⇄ folder、tag ⇄ ratio、folder ⇄ uncat
+   *         —— 都是入库图片的维度，AND 起来才符合「筛得更细」的直觉。
+   *   清空：filterAll 一次清掉全部（含 folderSelect 下拉框回写）。
+   *
+   * 点「未分类」时 folder 会残留（叠加语义）—— 这是有意的：
+   * 「未分类 + 某个目录」= 某个目录里还没归类的图，是个有用的入口。
+   * 想重来点「全部」。
+   */
   function filterUncategorized() {
     currentUncategorized = !currentUncategorized;
     if (currentUncategorized) { currentTag = ""; currentSource = ""; }
@@ -330,6 +396,10 @@
   function filterFolder(dir) {
     currentFolder = dir || "";
     currentSource = "";   // 目录是入库图片的维度，与三个外部来源互斥
+    // 标签栏的文件夹 chip 和工具栏的下拉框共用这一份状态：chip 上点掉一个目录时
+    // 没有这句同步，下拉框会停在旧选项上，看起来「还没取消」。
+    var sel = document.getElementById("folderSelect");
+    if (sel) sel.value = currentFolder;
     _page = 1; _modalIdx = -1;
     load();
   }
@@ -420,7 +490,7 @@
 
     var media = '<img src="' + url + '" data-ext="' + esc(i.ext || "") + '" alt="' + esc(i.filename) + '" loading="lazy">';
 
-    var badges = '<span class="badge tl' + (src.ro ? " ro" : "") + '">' + src.text + '</span>';
+    var badges = '<span class="badge tl' + (src.ro && !i.indexed ? " ro" : "") + '">' + src.text + '</span>';
     if (isVid) badges += '<span class="badge bl">▶</span>';
     if (ext) badges += '<span class="badge br">' + esc(ext) + '</span>';
 
@@ -531,9 +601,15 @@
     _favState[id] = !!(img.tags && img.tags.indexOf("☆收藏") >= 0);
     document.getElementById("favBtn").textContent = _favState[id] ? "★" : "☆";
 
-    // 只有入库的图可以改。内置素材/媒体库/生成图都是只读引用，
-    // 改名、删除、加标签对它们都没意义 —— 把它们灰掉，免得白点。
-    var editable = !img.source || img.source === "import";
+    // 只读判定只有一个来源：SOURCE_BADGE.ro，外加一个例外 —— indexed。
+    //
+    // 例外是干什么的：媒体库 / 生成图 / 内置素材平时不入库（没有 images 行，标签无处挂），
+    // 所以默认 ro。但媒体库现在会参与扫描入库（用户要求它「和别的图片目录没什么区别」），
+    // 入库之后服务端返回 indexed=true + 真实行 —— 这时按钮必须亮，否则功能等于没开。
+    // 判定跟的是「有没有落脚点」，不再是「来源标签」。
+    // 只有那三类里**还没入库**的才保持只读。
+    var _badge = SOURCE_BADGE[img.source] || SOURCE_BADGE["import"];
+    var editable = !img.source || img.indexed === true || !_badge.ro;
     document.getElementById("modalActions").classList.toggle("readonly", !editable);
     document.getElementById("favBtn").style.opacity = editable ? "1" : ".35";
 
@@ -842,6 +918,8 @@
   function batchDelete() {
     var ids = selectedIds();
     if (!ids.length) return showMsg("先勾选一些图片", "info");
+    _pendingPlan = null;
+    resetDeleteModalText();   // 上一次的两段确认文案要先还原，否则会带进来
     var p = document.querySelector("#deleteModal p");
     if (p) p.textContent = "确认删除选中的 " + ids.length + " 张？";
     document.getElementById("deleteFileToo").checked = false;
@@ -965,22 +1043,82 @@
       .catch(function (e) { showMsg("失败: " + e.message, "error"); });
   }
 
+  /** 确认删除弹窗的默认文案。两段确认会改写 <p> 和「确认删除」按钮，取消/完成后要还原。 */
+  var _deleteModalDefault = null;
+  /** 第一段拿到的风险计划；null = 还没走到第二段。 */
+  var _pendingPlan = null;
+
+  function resetDeleteModalText() {
+    var p = document.querySelector("#deleteModal p");
+    var ok = document.querySelector("#deleteModal button.danger");
+    if (!p || !ok) return;
+    if (!_deleteModalDefault) _deleteModalDefault = { p: p.textContent, ok: ok.textContent };
+    p.textContent = _deleteModalDefault.p;
+    ok.textContent = _deleteModalDefault.ok;
+  }
+
   function deleteImage() {
     if (!window._currentId) return;
+    _pendingPlan = null;
+    resetDeleteModalText();
     document.getElementById("deleteFileToo").checked = false;
     document.getElementById("deleteModal").classList.add("show");
   }
-  function closeDeleteModal() { document.getElementById("deleteModal").classList.remove("show"); }
+  function closeDeleteModal() {
+    document.getElementById("deleteModal").classList.remove("show");
+    _pendingPlan = null;
+    resetDeleteModalText();
+  }
+
+  /**
+   * 第一段：只拿风险计划，不删任何东西，弹窗也不关。
+   * 「删几个、能不能恢复」必须先摆到用户面前，他再点一次才算数 ——
+   * 连磁盘一起删是不可恢复的，以前却是勾个框一按就没。
+   */
+  function requestDeletePlan(ids) {
+    apiFetch("/delete/plan", {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ids: ids, deleteFile: true }),
+    })
+      .then(function (r) { return r.json(); })
+      .then(function (d) {
+        if (!d.ok) return showMsg("拿不到删除计划：" + (d.message || d.error || d.code || "后端未就绪"), "error");
+        _pendingPlan = d;
+        var n = d.count || ids.length;
+        var names = (d.targets || []).slice(0, 5).map(function (t) { return t.filename; }).filter(Boolean);
+        var lines = ["将从磁盘删除 " + n + " 个文件，不可恢复。"];
+        if (names.length) lines.push("例如：" + names.join("、") + (n > names.length ? " …等" : ""));
+        lines.push("核对无误，再点一次「确认删除」。");
+        var p = document.querySelector("#deleteModal p");
+        if (p) p.innerHTML = lines.map(esc).join("<br>");
+        var ok = document.querySelector("#deleteModal button.danger");
+        if (ok) ok.textContent = "确认删除 " + n + " 个文件";
+      })
+      .catch(function (e) { showMsg("拿不到删除计划: " + e.message, "error"); });
+  }
 
   function doDelete() {
     var alsoFile = document.getElementById("deleteFileToo").checked;
-    closeDeleteModal();
     // 多选且有勾选 → 批量；否则删当前弹窗那一张。
     var ids = (selMode && selectedIds().length) ? selectedIds() : [window._currentId].filter(Boolean);
-    if (!ids.length) return;
+    if (!ids.length) return showMsg("没有选中要删除的图片", "info");
+
+    // 只删索引：一步到位，与以前完全一样 —— 低风险操作不加确认，加了就是累赘。
+    // 连磁盘一起删：两段，第一段刚拿到计划就直接执行第二次点击。
+    if (alsoFile && !_pendingPlan) return requestDeletePlan(ids);
+
+    var plan = _pendingPlan;
+    _pendingPlan = null;
+    closeDeleteModal();
     apiFetch("/delete", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ids: ids, deleteFile: alsoFile }),
+      // challengeId / planHash 只在删磁盘文件时带；JSON.stringify 会丢掉 undefined，
+      // 所以「只删索引」的请求体与以前一字不差。
+      body: JSON.stringify({
+        ids: ids, deleteFile: alsoFile,
+        challengeId: plan && plan.challengeId,
+        planHash: plan && plan.planHash,
+      }),
     })
       .then(function (r) { return r.json(); })
       .then(function (d) {
@@ -988,12 +1126,22 @@
           closeModal();
           // 「库删了、磁盘没删掉」必须说出来。以前无论磁盘删没删都报
           // 「已删除（含磁盘文件）」，于是文件还在文件夹里、界面却报成功。
-          var failed = (d.errors || []).length;
-          var n = d.removed || ids.length;
-          if (alsoFile && failed) {
-            var why = (d.errors[0] && d.errors[0].error) || "文件被占用";
-            showMsg("库记录已删 " + n + " 张，但磁盘文件还有 " + failed + " 个没删掉（" + why
-              + "）。文件留着的话点「重新扫描」可以重新入库。", "error", 12000);
+          //
+          // 现在失败分两类，必须分开说（否则会把「什么都没删」说成「磁盘没删掉」）：
+          //   · 库侧失败：数据库那步抛错 → 文件根本没碰，重试即可
+          //   · 文件侧失败：库已删、文件没删掉 → 重新扫描可恢复
+          // filesRequested 只在「库删成功、真去删文件」时才计数，
+          // 所以文件侧失败 = filesRequested - filesDeleted，库侧失败 = ids - removed。
+          var n = d.removed || 0;
+          var fileFailed = Math.max(0, (d.filesRequested || 0) - (d.filesDeleted || 0));
+          var dbFailed = Math.max(0, ids.length - n);
+          var why = (d.errors && d.errors[0] && d.errors[0].error) || "";
+          if (dbFailed) {
+            showMsg(dbFailed + " 张没删掉：库记录删除失败（" + (why || "数据库错误")
+              + "）。文件和记录都没动，可以直接重试。", "error", 12000);
+          } else if (alsoFile && fileFailed) {
+            showMsg("库记录已删 " + n + " 张，但磁盘文件还有 " + fileFailed + " 个没删掉（"
+              + (why || "文件被占用") + "）。文件留着的话点「重新扫描」可以重新入库。", "error", 12000);
           } else if (alsoFile) {
             showMsg("已删除（含磁盘文件）：" + n + " 张", "success");
           } else {
@@ -1234,10 +1382,14 @@
 
   /* ═══════ 索引维护：失效记录（文件被移走/改名后库里留下的空壳）═══════ */
 
+  /** 第一段拿到的清理风险计划；null = 还没走到第二段。 */
+  var _pendingPurgePlan = null;
+
   async function checkMissing() {
     var btn = document.getElementById("missingBtn");
     var box = document.getElementById("missingBox");
     var txt = document.getElementById("missingText");
+    _pendingPurgePlan = null;   // 重新检查 → 上一次的风险计划作废（集合可能已变）
     if (btn) { btn.disabled = true; btn.textContent = "检查中…"; }
     try {
       var r = await apiFetch("/missing", {
@@ -1267,16 +1419,32 @@
 
   async function purgeMissing() {
     try {
+      // 两段：第一次点只拿风险计划（不删任何东西），把条数摆出来，
+      // 用户再点一次才带 challengeId + planHash 真清。后端会拒绝没有计划的直接调用。
+      if (!_pendingPurgePlan) {
+        var pr = await apiFetch("/missing/purge/plan", {
+          method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        });
+        var pd = await pr.json();
+        if (!pd.ok) return showMsg("拿不到清理计划: " + (pd.message || pd.error || pd.code || "后端未就绪"), "error");
+        _pendingPurgePlan = pd;
+        showMsg("将清理 " + (pd.count || 0) + " 条失效记录（只删索引与缩略图缓存，磁盘文件不动）。核对无误再点一次「清理」。", "info", 12000);
+        return;
+      }
+      var plan = _pendingPurgePlan;
+      _pendingPurgePlan = null;
       var r = await apiFetch("/missing/purge", {
-        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ challengeId: plan.challengeId, planHash: plan.planHash }),
       });
       var d = await r.json();
-      if (!d.ok) return showMsg("清理失败: " + (d.error || "未知原因"), "error");
+      if (!d.ok) return showMsg("清理失败: " + (d.message || d.error || d.code || "未知原因"), "error");
       var box = document.getElementById("missingBox");
       if (box) box.hidden = true;
       showMsg("已清理 " + d.removed + " 条失效记录（顺带删了 " + (d.thumbs || 0) + " 张缩略图缓存）；磁盘文件没动。", "success");
       if (d.removed) await load();
     } catch (e) {
+      _pendingPurgePlan = null;
       showMsg("清理出错: " + e.message, "error");
     }
   }
@@ -1877,6 +2045,7 @@
     zoomImg: zoomImg, resetZoom: resetZoom, toggleFavorite: toggleFavorite,
     aiSuggestName: aiSuggestName, renameImage: renameImage,
     deleteImage: deleteImage, closeDeleteModal: closeDeleteModal, doDelete: doDelete,
+    askDeleteTag: askDeleteTag, closeTagDeleteModal: closeTagDeleteModal, confirmDeleteTag: confirmDeleteTag,
     showGroupPanel: showGroupPanel, addGroupTag: addGroupTag,
     openSettings: openSettings, closeSettings: closeSettings,
     addScanPath: addScanPath, saveConfig: saveConfig, refreshGenSources: refreshGenSources,

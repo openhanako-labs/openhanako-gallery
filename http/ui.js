@@ -163,6 +163,13 @@ export default function (app, ctx) {
   });
   app.post("/missing/purge", async (c) => c.json(await callService("/missing/purge")));
 
+  /**
+   * 两段清理的第一段：只签发风险计划，不删任何东西。
+   * 服务端要求第二段带 challengeId + planHash 才肯动手，所以这两条必须成对存在 ——
+   * 只注册 /missing/purge 不注册 /missing/purge/plan，前端那颗按钮就永远报 PLAN_REQUIRED。
+   */
+  app.post("/missing/purge/plan", async (c) => c.json(await callService("/missing/purge/plan", {})));
+
   /* ── 语义向量 ── */
   app.get("/embed/sources", async (c) => c.json(await callService("/embed/sources")));
   app.post("/embed/test", async (c) => {
@@ -198,6 +205,12 @@ export default function (app, ctx) {
   app.post("/tags/remove", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     return c.json(await callService("/tags/remove", body));
+  });
+
+  /** 整条删除标签（从所有图片上摘掉 + 删标签行）。与 /tags/remove 的「只摘不删」不同。 */
+  app.post("/tags/delete", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    return c.json(await callService("/tags/delete", body));
   });
 
   /* ── 配置 ── */
@@ -268,6 +281,12 @@ export default function (app, ctx) {
   app.post("/delete", async (c) => {
     const body = await c.req.json().catch(() => ({}));
     return c.json(await callService("/delete", body));
+  });
+
+  /** 两段删除的第一段：拿风险计划（challengeId + planHash），不删任何东西。 */
+  app.post("/delete/plan", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    return c.json(await callService("/delete/plan", body));
   });
 
   app.post("/forget", async (c) => {

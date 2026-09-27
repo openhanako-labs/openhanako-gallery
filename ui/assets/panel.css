@@ -383,6 +383,19 @@ button { cursor: pointer; border: 0; background: transparent; }
 }
 .tag.active b { color: var(--g-accent-ink); opacity: .72; }
 
+/* 悬停标签时出现的 ×：整条删除标签（从所有图片上摘掉 + 删标签行）。
+   平时隐藏，免得标签栏看着像一排可编辑输入框。 */
+.tag-x {
+  display: none;
+  margin-left: 7px;
+  opacity: .55;
+  cursor: pointer;
+  font-weight: 700;
+  padding: 0 2px;
+}
+.tag:hover .tag-x { display: inline; }
+.tag-x:hover { opacity: 1; color: var(--g-danger); }
+
 /* 来源分组：不是标签，是 source 过滤 —— 虚线区分 */
 .tag-source { border: 1px dashed var(--g-divider); color: var(--g-ter); }
 .tag-source:hover { border-style: solid; background: var(--g-hover); color: var(--g-text); }

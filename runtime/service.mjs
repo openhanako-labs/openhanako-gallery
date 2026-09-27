@@ -27,6 +27,7 @@ import crypto from "node:crypto";
 import { pathToFileURL } from "node:url";
 import { spawn as spawnProcess, spawnSync } from "node:child_process";
 import { DatabaseSync } from "node:sqlite";
+import { ensureSchema, seg } from "./schema.mjs";
 
 const DATA_DIR = process.argv[2] || process.env.HANAKO_PLUGIN_DATA || "";
 const PORT = Number(process.argv[3]) || 43180;
@@ -557,21 +558,9 @@ function writeConfig(patch) {
 }
 
 // ── 数据库 ──
+// 建表 / 迁移 / CJK 分段全部抽到 schema.mjs —— schema 的读、改、验收都在那个文件里，
+// 这里只管「打开一份可用的连接」。见 schema.mjs 顶部的完整说明。
 let db = null;
-
-const CJK = /[\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uF900-\uFAFF\uAC00-\uD7AF]/;
-
-/** CJK 逐字切分：unicode61 会把连续汉字当单个 token，中文检索必须逐字拆。 */
-function seg(value) {
-  if (value == null) return "";
-  let out = "";
-  for (const ch of String(value)) {
-    if (CJK.test(ch)) out += ` ${ch} `;
-    else if (/[A-Za-z0-9]/.test(ch)) out += ch;
-    else out += " ";
-  }
-  return out.replace(/\s+/g, " ").trim();
-}
 
 /** 查询转 MATCH 表达式。前缀通配必须写成 "tokens"*（引号闭合后再加 *）。 */
 function toMatchQuery(value) {
@@ -589,104 +578,15 @@ function openDb() {
   if (db) return db;
   fs.mkdirSync(DATA_DIR, { recursive: true });
   db = new DatabaseSync(DB_PATH);
-  db.function("hana_seg", { deterministic: true }, seg);
-  db.exec(`
-    CREATE TABLE IF NOT EXISTS images (
-      id             TEXT PRIMARY KEY,
-      file_hash      TEXT NOT NULL UNIQUE,
-      path           TEXT NOT NULL,
-      filename       TEXT NOT NULL,
-      ext            TEXT NOT NULL,
-      size_bytes     INTEGER,
-      width          INTEGER,
-      height         INTEGER,
-      date_taken     TEXT,
-      date_imported  TEXT NOT NULL,
-      date_modified  TEXT,
-      camera_make    TEXT,
-      camera_model   TEXT,
-      thumbnail_path TEXT,
-      hidden         INTEGER DEFAULT 0,
-      source_path    TEXT
-    );
-    CREATE INDEX IF NOT EXISTS idx_date_taken ON images(date_taken);
-    CREATE INDEX IF NOT EXISTS idx_date_imported ON images(date_imported);
-    CREATE INDEX IF NOT EXISTS idx_ext ON images(ext);
-
-    CREATE TABLE IF NOT EXISTS tags (
-      id    INTEGER PRIMARY KEY AUTOINCREMENT,
-      name  TEXT NOT NULL UNIQUE
-    );
-    CREATE TABLE IF NOT EXISTS image_tags (
-      image_id TEXT NOT NULL REFERENCES images(id),
-      tag_id   INTEGER NOT NULL REFERENCES tags(id),
-      PRIMARY KEY (image_id, tag_id)
-    );
-    CREATE INDEX IF NOT EXISTS idx_image_tags_tag ON image_tags(tag_id);
-
-    CREATE VIRTUAL TABLE IF NOT EXISTS images_fts USING fts5(
-      image_id UNINDEXED, filename, path, tokenize='unicode61 remove_diacritics 1'
-    );
-    CREATE TRIGGER IF NOT EXISTS images_fts_ai AFTER INSERT ON images BEGIN
-      INSERT INTO images_fts(image_id, filename, path)
-      VALUES (new.id, hana_seg(new.filename), hana_seg(new.path));
-    END;
-    CREATE TRIGGER IF NOT EXISTS images_fts_au AFTER UPDATE OF filename, path ON images BEGIN
-      DELETE FROM images_fts WHERE image_id = old.id;
-      INSERT INTO images_fts(image_id, filename, path)
-      VALUES (new.id, hana_seg(new.filename), hana_seg(new.path));
-    END;
-    CREATE TRIGGER IF NOT EXISTS images_fts_ad AFTER DELETE ON images BEGIN
-      DELETE FROM images_fts WHERE image_id = old.id;
-    END;
-  `);
-  // 增量扫描靠 (size, mtime) 判「文件是否变过」，旧库没这列 —— 补上。
-  // 已有行的 mtime_ms 为 NULL，首次增量重扫时会各哈希一遍，之后就是零成本跳过了。
+  // 迁移全部走 schema.mjs 的 ensureSchema（版本化，见该文件顶部说明）。
+  // 这里只关心：迁移完、缩略图目录就位，就返回可写的连接。
   try {
-    const cols = db.prepare("PRAGMA table_info(images)").all().map((c) => c.name);
-    if (!cols.includes("mtime_ms")) db.exec("ALTER TABLE images ADD COLUMN mtime_ms INTEGER");
-  } catch { /* 补列失败不致命，退化为每次都哈希 */ }
-
-  // 识图写的描述（模型看图说的那句中文）落在 images.description，并进 FTS。
-  //
-  // 两个坑：
-  //   1. FTS5 虚拟表**不能 ALTER 加列**，只能整表重建 + 重灌。
-  //   2. 旧触发器是 `AFTER UPDATE OF filename, path` —— 只写 description 不会触发
-  //      重索引，表现就是「识图跑完了但搜不到」。改成 `OF filename, path, description`。
-  // 用 fts 表自身的 SQL 文本判断是否已迁移，跑一次就跳过。
-  try {
-    const cols2 = db.prepare("PRAGMA table_info(images)").all().map((c) => c.name);
-    if (!cols2.includes("description")) db.exec("ALTER TABLE images ADD COLUMN description TEXT");
-    // 模型给的文件名短名（面板的「命名 / 批量命名」用它，而不是从标签里挑 ——
-    // 标签是检索维度，不是命名维度：实测挑出过 `C-二次元` 这种名字）。
-    if (!cols2.includes("ai_name")) db.exec("ALTER TABLE images ADD COLUMN ai_name TEXT");
-    const ftsSql = db.prepare("SELECT sql FROM sqlite_master WHERE name = 'images_fts'").get()?.sql || "";
-    if (!/description/.test(ftsSql)) {
-      db.exec(`
-        DROP TRIGGER IF EXISTS images_fts_ai;
-        DROP TRIGGER IF EXISTS images_fts_au;
-        DROP TRIGGER IF EXISTS images_fts_ad;
-        DROP TABLE IF EXISTS images_fts;
-        CREATE VIRTUAL TABLE images_fts USING fts5(
-          image_id UNINDEXED, filename, path, description, tokenize='unicode61 remove_diacritics 1'
-        );
-        CREATE TRIGGER images_fts_ai AFTER INSERT ON images BEGIN
-          INSERT INTO images_fts(image_id, filename, path, description)
-          VALUES (new.id, hana_seg(new.filename), hana_seg(new.path), hana_seg(COALESCE(new.description, '')));
-        END;
-        CREATE TRIGGER images_fts_au AFTER UPDATE OF filename, path, description ON images BEGIN
-          DELETE FROM images_fts WHERE image_id = old.id;
-          INSERT INTO images_fts(image_id, filename, path, description)
-          VALUES (new.id, hana_seg(new.filename), hana_seg(new.path), hana_seg(COALESCE(new.description, '')));
-        END;
-        CREATE TRIGGER images_fts_ad AFTER DELETE ON images BEGIN
-          DELETE FROM images_fts WHERE image_id = old.id;
-        END;
-        INSERT INTO images_fts(image_id, filename, path, description)
-          SELECT id, hana_seg(filename), hana_seg(path), hana_seg(COALESCE(description, '')) FROM images;
-      `);
-    }
-  } catch { /* 迁移失败不致命：描述仍写进 images，只是搜不到 */ }
+    ensureSchema(db);
+  } catch (e) {
+    // 迁移失败 = 索引库不可用。抛出来，让 server.listen 报错，AppHost 侧看到错误。
+    // 原来的实现是 try/catch 静默——那样用户看到的是「能启动但一堆功能失效」，更糟。
+    throw e;
+  }
   fs.mkdirSync(THUMB_DIR, { recursive: true });
   return db;
 }
@@ -752,6 +652,171 @@ async function unlinkWithRetry(file, tries = 4) {
   }
   return { ok: false, error: last };
 }
+
+// ── 防手滑基础设施：challenge 与 idempotency ────────────────────────
+// 两个内存 Map，服务进程重启后都作废——重启后用户重新走一遍 plan 即可。
+// 为什么不落盘：这两块都是「防手滑」的临时凭证，不需要跨重启。一旦落盘，
+// 就变成“重启后还能拿老凭证去删老数据”，反而出新问题。
+
+/** challenge 10 分钟失效（契约要求）。 */
+const CHALLENGE_TTL_MS = 10 * 60 * 1000;
+
+/** 已签发的 challenge 缓存：challengeId → { planHash, expiresAt, imagesTotal, deleteFile }。
+ *  一次性：consumeChallenge 里写入即删。 */
+const challengeCache = new Map();
+let _lastChallengeSweep = 0;
+
+/** 签一个 challenge：一次性凭证，一次性消费。 */
+function issueChallenge({ planHash, deleteFile, count }) {
+  const challengeId = crypto.randomUUID();
+  const now = Date.now();
+  challengeCache.set(challengeId, {
+    planHash, deleteFile, count, issuedAt: now, expiresAt: now + CHALLENGE_TTL_MS,
+  });
+  // 惰性清理：60s 内最多扫一次，避免 Map 无限增长
+  if (now - _lastChallengeSweep > 60000) {
+    _lastChallengeSweep = now;
+    for (const [k, v] of challengeCache) if (v.expiresAt <= now) challengeCache.delete(k);
+  }
+  return { challengeId, planHash, expiresAt: now + CHALLENGE_TTL_MS, count, deleteFile };
+}
+
+/** 一次性消费 challenge。任何一条不满足都返回 PLAN_REQUIRED——不泄露细节，
+ *  避免攻击者从错误信息里反推校验条件。 */
+function consumeChallenge(body) {
+  const PLAN_REQUIRED = { ok: false, code: "PLAN_REQUIRED", message: "需要先调用 /delete/plan 获取确认令牌" };
+  const challengeId = body.challengeId;
+  const planHash = body.planHash;
+  if (!challengeId || !planHash) return { ok: false, ...PLAN_REQUIRED };
+  const c = challengeCache.get(challengeId);
+  if (!c) return { ok: false, ...PLAN_REQUIRED };
+  challengeCache.delete(challengeId);   // 一次性：先删再判，避免并发重复使用
+  if (c.expiresAt <= Date.now()) return { ok: false, ...PLAN_REQUIRED };
+  if (c.planHash !== planHash) return { ok: false, ...PLAN_REQUIRED };
+  return { ok: true, challenge: c };
+}
+
+/** /delete/plan 的 planHash：sha256(ids 升序 join(",") + "|" + deleteFile + "|" + images 总行数) 前 16 hex。 */
+function computePlanHashForIds(ids, deleteFile) {
+  const sorted = [...ids].sort();
+  const imagesTotal = q1("SELECT COUNT(*) AS c FROM images")?.c ?? 0;
+  return crypto.createHash("sha256").update(`${sorted.join(",")}|${deleteFile}|${imagesTotal}`).digest("hex").slice(0, 16);
+}
+
+/** 收集当前所有 missing id（hidden=0、非外链、path 非空、磁盘上不存在）。
+ *  与 /missing 报告完全同口径。 */
+async function collectMissingIds() {
+  const rows = q("SELECT id, path FROM images WHERE hidden = 0 AND path NOT LIKE 'ext:%' AND path <> ''");
+  const ids = [];
+  for (const r of rows) {
+    const p = String(r.path || "");
+    if (!p) continue;
+    try { if (!fs.existsSync(p)) ids.push(r.id); } catch { ids.push(r.id); }
+  }
+  return ids.sort();
+}
+
+/** /missing/purge/plan 的 planHash：当前 missing id 升序的 sha256 前 16 hex。
+ *  与 /delete/plan 不同口径：因为 missing 集合是动态的，不依赖删除 ids 参数。 */
+function computeMissingPlanHash(missingIds) {
+  return crypto.createHash("sha256").update([...missingIds].sort().join(",")).digest("hex").slice(0, 16);
+}
+
+/**
+ * 两段删除校验：/delete 当 deleteFile=true 时必须先 plan。
+ * 返回 { ok, code, message }；ok=true 时无额外字段。
+ */
+function validateDeleteChallenge(body, sortedIds) {
+  const planHash = computePlanHashForIds(sortedIds, true);
+  const r = consumeChallenge({ challengeId: body.challengeId, planHash });
+  if (!r.ok) return r;
+  return { ok: true };
+}
+
+// ── 幂等键（/scan、/push） ─────────────────────────────────
+const IDEMPOTENCY_TTL_MS = 10 * 60 * 1000;
+const idempotencyCache = new Map();   // key → { fingerprint, result, expiresAt }
+let _lastIdempotencySweep = 0;
+
+/** 校验幂等键格式：字符串、trim 后非空、≤ 128 字符。 */
+function validateIdempotencyKey(raw) {
+  if (raw === undefined || raw === null) return { valid: true, key: null };
+  if (typeof raw !== "string") return { valid: false, code: "INVALID_IDEMPOTENCY_KEY", message: "幂等键必须是字符串" };
+  const key = raw.trim();
+  if (!key) return { valid: false, code: "INVALID_IDEMPOTENCY_KEY", message: "幂等键不能为空白" };
+  if (key.length > 128) return { valid: false, code: "INVALID_IDEMPOTENCY_KEY", message: "幂等键长度不得超过 128 字符" };
+  return { valid: true, key };
+}
+
+/**
+ * 稳定序列化：递归按键排序后再 JSON.stringify。
+ * 目的：{a:1,b:2} 与 {b:2,a:1} 判成同一指纹——调用方传参顺序抖动不再误报 KEY_REUSED。
+ * 十几行手写，不引依赖。
+ */
+function stableStringify(value) {
+  if (value === null || typeof value !== "object") return JSON.stringify(value);
+  if (Array.isArray(value)) return "[" + value.map(stableStringify).join(",") + "]";
+  const parts = [];
+  for (const key of Object.keys(value).sort()) {
+    const v = value[key];
+    if (v === undefined) continue;
+    parts.push(JSON.stringify(key) + ":" + stableStringify(v));
+  }
+  return "{" + parts.join(",") + "}";
+}
+
+/**
+ * 幂等键检查。未传 key 时 { skipped: true }（与现行为完全一致，不产生新字段）；
+ * 同 key + 同参数 → 回放上次结果（{ ok, result, replayed:true }）；
+ * 同 key + 异参数 → 报 KEY_REUSED；同 key + 上次请求还在跑（result 未就绪）→ 报 IDEMPOTENCY_IN_FLIGHT。
+ *
+ * envSnapshot：环境快照（如 /scan 的 scanPaths + galleryRoot、/push 的 blogImagesPath + dest）。
+ * 一起进指纹——配置一变指纹就变，旧条目自然失效，避免
+ * “同 key 同参数在 TTL 内重发却回放陈旧结果”（扫描目录改了、目标目录文件被外部删了都算）。
+ */
+function checkIdempotency(body, envSnapshot) {
+  const v = validateIdempotencyKey(body.idempotencyKey);
+  if (!v.valid) return { ok: false, code: v.code, message: v.message };
+  if (!v.key) return { skipped: true };
+  // 指纹 = 业务参数（除 idempotencyKey 外的全部 body）+ 环境快照，各自稳定序列化后拼接。
+  // 不额外白名单“业务字段”：避免遗漏新参数时幂等失效反而更难查。
+  const { idempotencyKey: _drop, ...rest } = body;
+  const fingerprint = stableStringify(rest) + "|" + stableStringify(envSnapshot || {});
+  const hit = idempotencyCache.get(v.key);
+  const now = Date.now();
+  if (hit && hit.expiresAt > now) {
+    if (hit.fingerprint === fingerprint) {
+      // 上次请求还在跑（result 未就绪）：明确报错，不等待。
+      // 等待会把 HTTP 连接挂住——客户端超时后重试只会再撞一次，不如让它立刻发现。
+      // finishIdempotency 写入成功结果后，这个错误自然消失。
+      if (hit.result == null) {
+        return { ok: false, code: "IDEMPOTENCY_IN_FLIGHT", message: "同一幂等键的上一次请求还在执行" };
+      }
+      return { ok: true, result: hit.result, replayed: true };
+    }
+    return { ok: false, code: "IDEMPOTENCY_KEY_REUSED", message: "同一幂等键的参数不一致" };
+  }
+  idempotencyCache.set(v.key, { fingerprint, result: null, expiresAt: now + IDEMPOTENCY_TTL_MS });
+  if (now - _lastIdempotencySweep > 60000) {
+    _lastIdempotencySweep = now;
+    for (const [k, v2] of idempotencyCache) if (v2.expiresAt <= now) idempotencyCache.delete(k);
+  }
+  return { pendingKey: v.key };
+}
+
+/** 幂等完成后将结果写入缓存；失败时清理 pending 行，允许重试。 */
+function finishIdempotency(body, result, ok = true) {
+  // 复用 checkIdempotency 的 key 校验——避免两处各自 String().trim() 导致分叉。
+  // 拿不到合法 key 就原样返回，不写缓存。
+  const v = validateIdempotencyKey(body.idempotencyKey);
+  if (!v.valid || !v.key) return result;
+  const entry = idempotencyCache.get(v.key);
+  if (!entry) return result;
+  if (ok) entry.result = result;
+  else idempotencyCache.delete(v.key);
+  return result;
+}
+
 
 /**
  * 缩略图缓存 key。
@@ -1482,6 +1547,39 @@ let lastScanAt = 0;
 /** 扫描循环里每处理多少个文件就让出一次事件循环（见 /scan）。 */
 const SCAN_YIELD_EVERY = 200;
 
+/**
+ * 把「已经入库」的外部来源条目换成真实行。
+ *
+ * 三个来源（生成图 / 内置素材 / 媒体库）平时不入库，靠合成 id（gen_ / builtin_ /
+ * medlib_ + owner + 文件名）实时列目录。一旦某个文件被扫进 images，同一个文件
+ * 就会有两个 id：收藏状态、缩略图、标签各记一份，详情弹窗还会因为「来源不是 import」
+ * 把按钮灰掉 —— 用户看到的就是「明明打过标签，打开却什么都没有」。
+ *
+ * 所以：入库了就让真实行接管，合成 id 只留给还没入库的那些。
+ * source 保留原值（角标还得说清它来自哪个来源），indexed=true 让前端放行编辑。
+ */
+function replaceIndexed(items, sourceLabel) {
+  const ps = items.map((x) => x.path).filter((p) => p && !String(p).startsWith("ext:"));
+  if (!ps.length) return items;
+  const marks = ps.map(() => "?").join(",");
+  const rows = q(`SELECT id, filename, ext, path, size_bytes, width, height, date_taken,
+                  date_imported, thumbnail_path, description, ai_name
+                  FROM images WHERE path IN (${marks})`, ps);
+  if (!rows.length) return items;
+  const byPath = new Map(rows.map((r) => [String(r.path), r]));
+  return items.map((x) => {
+    const row = byPath.get(String(x.path));
+    if (!row) return x;
+    row.tags = q(`SELECT t.name FROM tags t JOIN image_tags it ON t.id = it.tag_id
+                  WHERE it.image_id = ? ORDER BY t.name`, [row.id]).map((y) => y.name);
+    row.media_type = VIDEO_EXTS.has("." + String(row.ext).toLowerCase()) ? "video" : "image";
+    row.source = sourceLabel;
+    row.indexed = true;
+    row.favorited = row.tags.includes(FAVORITE_TAG) ? 1 : 0;
+    return row;
+  });
+}
+
 const routes = {
   /** 环境与能力探测。UI 首屏据此决定是否提示"缩略图降级"。 */
   "/status": async () => ({
@@ -1572,6 +1670,9 @@ const routes = {
         const rows = q("SELECT id, thumbnail_path FROM images WHERE source_path = ? OR source_path = ?", [norm, String(old)]);
         for (const r of rows) {
           if (r.thumbnail_path) { try { fs.unlinkSync(r.thumbnail_path); } catch { /* 已不存在 */ } }
+          // 先清子表（外键不开 CASCADE）再删 images——
+          // ai_content 是本轮新增的（AI 三层分离的权威层），同样需要显式清。
+          run("DELETE FROM ai_content WHERE image_id = ?", [r.id]);
           run("DELETE FROM image_tags WHERE image_id = ?", [r.id]);
           run("DELETE FROM images WHERE id = ?", [r.id]);
           pruned++;
@@ -1583,7 +1684,22 @@ const routes = {
 
   /** 扫描并入库。同步实现；图片多时由 AppHost 侧轮询超时保护。 */
   "/scan": async (_req, body) => {
+    // ── 幂等键处理（新增） ──
+    // 同 key + 同参数 → 回放上次结果；同 key + 异参数 → 报错；
+    // 上次请求还在跑 → 报 IDEMPOTENCY_IN_FLIGHT；未传 → 行为不变。
+    // 指纹含 body 参数 + 环境快照（scanPaths + galleryRoot）——配置一变指纹就变，
+    // 避免同 key 同参数在 TTL 内重发却回放陈旧结果。
     const cfg = readConfig();
+    const idem = checkIdempotency(body, {
+      scanPaths: cfg.scanPaths || [],
+      galleryRoot: cfg.galleryRoot,
+    });
+    if (!idem.skipped && !idem.pendingKey && !idem.ok) {
+      return { ok: false, status: "error", code: idem.code, message: idem.message };
+    }
+    if (idem.ok) return { ...idem.result, replayed: true };
+
+    // （cfg 已在上方幂等处理时读取，不再重复 readConfig）
     // 显式目标可以是 paths 数组，也可以是单个 path —— 两种写法都认，
     // 免得调用方传了 path 却被静默忽略、回退到配置根。
     const explicit = (Array.isArray(body.paths) && body.paths.length)
@@ -1600,6 +1716,19 @@ const routes = {
             const t = String(p || "").trim();
             if (t && !set.includes(t) && fs.existsSync(t)) set.push(t);
           }
+          // 生成图与媒体库（AI 生图的两类落地目录）默认一并入库。用户明确要它们
+          // 「和别的图片目录没什么区别」：不入库就没有 images 行，而标签、收藏、识图、
+          // 改名全都挂在 images 行上 —— 没行就只能把按钮灰掉。
+          // 显式传 paths 时不算它们：那表示「只扫这些」，别自作主张加料。
+          for (const d of [...discoverGeneratedDirs(), ...discoverMediaLibDirs()]) {
+            const t = String(d.dir || "").trim();
+            if (!t || !fs.existsSync(t)) continue;
+            if (set.includes(t)) continue;
+            // 已经被某个扫描根盖住了就别再走一遍（重复 walk 会被 file_hash 兕住，
+            // 但那次 hash 是白读的）。结尾的分隔符要补上，否则 "/a" 会匹配 "/ab"。
+            const covered = set.some((p) => t === p || t.startsWith(p + path.sep) || t.startsWith(p + "/"));
+            if (!covered) set.push(t);
+          }
           return set.length ? set : [cfg.galleryRoot];
         })();
     const started = Date.now();
@@ -1610,13 +1739,14 @@ const routes = {
     // 全局节流：不带显式路径的扫描就是「面板自己来刷新的那种」，刚扫过就直接跳过。
     // 显式路径（工具调用 / 用户手输目录）不节流 —— 那是真有人要看结果；force 同理。
     if (!explicit.length && body.force !== true && Date.now() - lastScanAt < SCAN_THROTTLE_MS) {
-      return {
+      const _r = {
         ok: true, status: "ok", skipped: true,
         reason: "刚扫过",
         sinceLastScanMs: Date.now() - lastScanAt,
         summary: { scanned: 0, imported: 0, updated: 0, skipped: 0, failed: 0, videosSkipped: 0, duration_ms: Date.now() - started, targets },
         errors: [],
       };
+      return finishIdempotency(body, _r, true);
     }
     // 先占位：两个请求同时进来时不会双双开扫。
     lastScanAt = Date.now();
@@ -1668,7 +1798,14 @@ const routes = {
           // ② 路径已知但内容变了 → 原地更新，**保留 id 与已打的标签**
           if (prev) {
             const dup = q1("SELECT id FROM images WHERE file_hash = ? AND id <> ?", [hash, prev.id]);
-            if (dup) { run("DELETE FROM images WHERE id = ?", [prev.id]); skipped++; continue; }
+            if (dup) {
+              // 去重删除：外键开之后必须先清 image_tags + ai_content，否则抛 FOREIGN KEY。
+              // 这里 image_tags 从来没清过，同类老问题一并修（否则被扫过的图也会删不掉）。
+              run("DELETE FROM image_tags WHERE image_id = ?", [prev.id]);
+              run("DELETE FROM ai_content WHERE image_id = ?", [prev.id]);
+              run("DELETE FROM images WHERE id = ?", [prev.id]);
+              skipped++; continue;
+            }
             const ex = await readExif(file);
             run(`UPDATE images SET file_hash = ?, size_bytes = ?, mtime_ms = ?, width = ?, height = ?,
                  date_taken = ?, date_modified = ?, camera_make = ?, camera_model = ? WHERE id = ?`, [
@@ -1704,7 +1841,8 @@ const routes = {
         }
       }
     }
-    return { ok: true, summary: { scanned, imported, updated, skipped, failed, videosSkipped: walkStats.videosSkipped, duration_ms: Date.now() - started, targets }, errors };
+    const _scanResult = { ok: true, summary: { scanned, imported, updated, skipped, failed, videosSkipped: walkStats.videosSkipped, duration_ms: Date.now() - started, targets }, errors };
+    return finishIdempotency(body, _scanResult, true);
   },
 
   /**
@@ -1806,7 +1944,9 @@ const routes = {
       const tp = Math.max(1, Math.ceil(t / limit));
       return {
         ok: true, status: "ok", total: t, count: slice.length, offset: off, limit,
-        page, totalPages: tp, pages: tp, results: slice, source: wantSource,
+        page, totalPages: tp, pages: tp,
+        results: replaceIndexed(slice, wantSource),
+        source: wantSource,
         totalGenerated: wantSource === "generated" ? t : 0,
         totalBuiltin: wantSource === "builtin" ? t : 0,
         totalMediaLib: wantSource === "media-lib" ? t : 0,
@@ -1840,7 +1980,14 @@ const routes = {
       const gen = listGenerated({ ...pick, sources: body.generatedSources || null });
       const builtin = listBuiltin({ ...pick, sources: body.builtinSources || null });
       const medlib = listMediaLib(pick);
+      // 与入库行去重。以前只拿「当前页的 path」比，于是同一个文件会出现两次：
+      // 第 1 页尾部一个合成副本（medlib_…），它真正该在的那一页又出现真实行。
+      // 现在把库里全部已入库路径都算进来 —— 已入库的就交给 SQL 按排序去它该去的页，
+      // 合成 id 只留给还没入库的。多一次全列查询，相对于每页 60 次标签查询可以忽略。
       const seen = new Set(rows.map((r) => r.path));
+      for (const r of q("SELECT path FROM images WHERE hidden = 0 AND path NOT LIKE 'ext:%'")) {
+        seen.add(String(r.path));
+      }
       let extra = gen.concat(builtin, medlib).filter((g) => !seen.has(g.path));
       // 只看视频时，这三个来源也得过同一道筛。
       if (body.videoOnly === true) extra = extra.filter((g) => g.media_type === "video");
@@ -1912,8 +2059,14 @@ const routes = {
     let changed = 0;
     for (const id of ids) {
       for (const tid of tagIds) {
-        if (remove) run("DELETE FROM image_tags WHERE image_id = ? AND tag_id = ?", [id, tid]);
-        else run("INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?, ?)", [id, tid]);
+        if (remove) {
+          run("DELETE FROM image_tags WHERE image_id = ? AND tag_id = ?", [id, tid]);
+        } else {
+          // 用户显式加标：命中已有 'ai' 归属时升级为 'user'——
+          // 与 /tags/add 同口径。否则 /ai/clear 会清掉用户亲自确认过的标签。
+          run(`INSERT INTO image_tags (image_id, tag_id, source) VALUES (?, ?, 'user')
+               ON CONFLICT(image_id, tag_id) DO UPDATE SET source = 'user'`, [id, tid]);
+        }
       }
       changed++;
     }
@@ -1963,19 +2116,62 @@ const routes = {
    * 清理失效记录。**只删索引记录与它的缩略图缓存，绝不动磁盘**（源文件已经不在了）。
    * 文件只是被移走的话，重新扫描会以新路径重新入库 —— 所以这一步是可逆的。
    */
-  "/missing/purge": async () => {
+  "/missing/purge": async (_req, body) => {
+    // 两段确认（契约要求）：/missing/purge 先调 /missing/purge/plan 拿 challengeId + planHash，
+    // 再过来带这两个字段。避免用户在看到“missing 数字”后一错手点了清理。
+    const body2 = body && typeof body === "object" ? body : {};
+    const r = consumeChallenge(body2);
+    if (!r.ok) {
+      return { ok: false, status: "error", code: "PLAN_REQUIRED", message: "需要先调用 /missing/purge/plan 获取确认令牌" };
+    }
+    // 双重校验：planHash 里存了当时 missing id 的 hash，防止两次请求之间
+    // 有人又扫描了或删了图，造成“看到的不是真的”。
+    const missingIds = await collectMissingIds();
+    const expectedHash = computeMissingPlanHash(missingIds);
+    if (r.challenge.planHash !== expectedHash) {
+      return { ok: false, status: "error", code: "PLAN_REQUIRED", message: "需要先调用 /missing/purge/plan 获取确认令牌" };
+    }
+
     const rows = q("SELECT id, path, thumbnail_path FROM images WHERE hidden = 0 AND path NOT LIKE 'ext:%'");
     let removed = 0;
     let thumbs = 0;
-    for (const r of rows) {
-      const p = String(r.path || "");
+    for (const rr of rows) {
+      const p = String(rr.path || "");
       if (!p || fs.existsSync(p)) continue;
-      if (r.thumbnail_path) { try { fs.unlinkSync(r.thumbnail_path); thumbs++; } catch { /* 已不在 */ } }
-      run("DELETE FROM image_tags WHERE image_id = ?", [r.id]);
-      run("DELETE FROM images WHERE id = ?", [r.id]);
+      // 先清 DB（含 ai_content）：外键 ai_content.image_id → images.id 不带 CASCADE，
+      // 必须先删子表。单条失败跳过继续，不让一条拖垮整个清理。
+      try {
+        run("DELETE FROM ai_content WHERE image_id = ?", [rr.id]);
+        run("DELETE FROM image_tags WHERE image_id = ?", [rr.id]);
+        run("DELETE FROM images WHERE id = ?", [rr.id]);
+      } catch { continue; }
+      if (rr.thumbnail_path) { try { fs.unlinkSync(rr.thumbnail_path); thumbs++; } catch { /* 已不在 */ } }
       removed++;
     }
     return { ok: true, status: "ok", removed, thumbs };
+  },
+
+  /**
+   * 失效记录的清理预确认：签一个 challenge + planHash。
+   * samples 复用 /missing 的样例结构 { id, path, filename }，限 50 条（契约）。
+   */
+  "/missing/purge/plan": async (_req, body) => {
+    const missingIds = await collectMissingIds();
+    const count = missingIds.length;
+    const planHash = computeMissingPlanHash(missingIds);
+    const issued = issueChallenge({ planHash, deleteFile: false, count });
+    // 样本：最多 50 条（与 /delete/plan 同口径）。
+    // 复用 /missing 的样例结构 { id, path, filename }。
+    const sampleIds = missingIds.slice(0, 50);
+    const samples = sampleIds.length
+      ? q(`SELECT id, path, filename FROM images WHERE id IN (${sampleIds.map(() => "?").join(",")})`, sampleIds)
+      : [];
+    return {
+      ok: true, status: "ok",
+      challengeId: issued.challengeId, planHash: issued.planHash,
+      expiresAt: issued.expiresAt, count, deleteFile: false,
+      samples,
+    };
   },
 
   /**
@@ -2016,6 +2212,36 @@ const routes = {
    * 标签走与 /tags 同一套 upsert，**只新增、不删用户自己打的标签**；
    * 重复识图会覆写 description（这就是“重跑一次”该有的行为）。
    */
+  "/ai/clear": async (_req, body) => {
+    // 清一张图的 AI 痕迹：ai_content（权威）、images.description / ai_name（投影）、
+    // image_tags 里 source='ai' 的关联。用户手打的标签（source='user'）保留。
+    //
+    // 为什么要“重建 FTS 条目”（契约原话）：UPDATE images SET description = NULL
+    // 会触发 images_fts_au（AFTER UPDATE OF description），自动把 FTS 行重建。
+    // 所以这里不需要手写 DELETE + INSERT。
+    const ids = Array.isArray(body?.ids) ? body.ids.map(String) : [];
+    if (!ids.length) return { ok: false, status: "error", error: "missing ids" };
+    let cleared = 0;
+    for (const id of ids) {
+      if (!q1("SELECT id FROM images WHERE id = ?", [id])) continue;
+      run("DELETE FROM ai_content WHERE image_id = ?", [id]);
+      run("UPDATE images SET description = NULL, ai_name = NULL WHERE id = ?", [id]);
+      run("DELETE FROM image_tags WHERE image_id = ? AND source = 'ai'", [id]);
+      cleared++;
+    }
+    return { ok: true, status: "ok", cleared };
+  },
+
+  /**
+   * 写入识图结果：描述 + 标签。
+   *
+   * AI 三层分离（见 schema.mjs 的版本 5 注释）：
+   *   ai_content        ← 权威层（描述、模型给的标签、分析时间、模型版本）
+   *   images.description / ai_name   ← FTS 投影（让现有搜索逻辑不改就能搜到）
+   *   image_tags.source='ai'         ← 标记哪些标签是 AI 打的（供 /ai/clear 清理）
+   *
+   * 重复识图 → ON CONFFLICT UPDATE ai_content；人工打的标签（source='user'）不动。
+   */
   "/describe": async (_req, body) => {
     const id = String(body.id || "");
     if (!id) return { ok: false, status: "error", error: "missing id" };
@@ -2030,19 +2256,42 @@ const routes = {
       .map((s) => String(s || "").trim()).filter(Boolean).slice(0, 24);
 
     if (clear) {
+      // 清掉识图结果：删权威层、清投影、删 AI 打的标签关联（保留用户手打的）。
+      // UPDATE description=NULL 会触发 images_fts_au，自动重建 FTS 条目。
+      run("DELETE FROM ai_content WHERE image_id = ?", [id]);
       run("UPDATE images SET description = NULL, ai_name = NULL WHERE id = ?", [id]);
-    } else {
-      run("UPDATE images SET description = ? WHERE id = ?", [desc, id]);
-      // name 只在模型真的给了的时候才写 —— 否则会把上一次的好名字冲成空。
-      if (aiName) run("UPDATE images SET ai_name = ? WHERE id = ?", [aiName, id]);
+      run("DELETE FROM image_tags WHERE image_id = ? AND source = 'ai'", [id]);
+      return { ok: true, status: "ok", id, description: "", name: "", tags: [], tagged: 0, cleared: true };
     }
+
+    // 1. 权威层：写 ai_content（UPSERT，重复识图会覆写上一次）。
+    //    ON CONFFLICT 更新描述与 tags_json；model/model_version/analyzed_at 也同步更新。
+    const now = new Date().toISOString();
+    run(`INSERT INTO ai_content (image_id, description, tags_json, model, model_version, analyzed_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFFLICT(image_id) DO UPDATE SET
+           description = excluded.description,
+           tags_json = excluded.tags_json,
+           model = excluded.model,
+           model_version = excluded.model_version,
+           analyzed_at = excluded.analyzed_at`, [
+      id, desc || null, JSON.stringify(names), null, null, now,
+    ]);
+
+    // 2. 投影：让 FTS 能搜到描述（触发器自动同步）、面板「批量命名」能直接用 ai_name。
+    run("UPDATE images SET description = ? WHERE id = ?", [desc || null, id]);
+    // name 只在模型真的给了的时候才写 —— 否则会把上一次的好名字冲成空。
+    if (aiName) run("UPDATE images SET ai_name = ? WHERE id = ?", [aiName, id]);
+
+    // 3. 打标：source='ai' 标记来源。INSERT OR IGNORE：关联已存在就跳过，
+    //    不会把用户先打的标签（source='user'）改写成 'ai'。
     let tagged = 0;
     for (const name of names) {
       run("INSERT OR IGNORE INTO tags (name) VALUES (?)", [name]);
       const t = q1("SELECT id FROM tags WHERE name = ?", [name]);
-      if (t) { run("INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?, ?)", [id, t.id]); tagged++; }
+      if (t) { run("INSERT OR IGNORE INTO image_tags (image_id, tag_id, source) VALUES (?, ?, 'ai')", [id, t.id]); tagged++; }
     }
-    return { ok: true, status: "ok", id, description: clear ? "" : desc, name: clear ? "" : aiName, tags: names, tagged, cleared: clear };
+    return { ok: true, status: "ok", id, description: desc, name: aiName, tags: names, tagged, cleared: false };
   },
 
   /* ── 语义向量 ── */
@@ -2168,6 +2417,46 @@ const routes = {
   },
 
   /**
+   * 删除预确认（两段删除的第一步）。
+   * 只适用于 deleteFile: true（连磁盘一起删）—— 误删磁盘文件不可恢复，先拿到一份
+   * “你确定要删这些文件”的快照，再拿快照回 /delete 才真删。
+   *
+   * planHash = sha256(ids 升序 join(",") + "|" + "true" + "|" + 当时的 images 总行数)
+   *   取前 16 hex。
+   * 用 images 总行数做“环境快照”：两次调用之间如果库变了，hash 就对不上，
+   * /delete 会自动拒绝——避免用户拿老 challenge 去删新扫进的图。
+   *
+   * 成功返回的样本最多 50 条（只作展示），count 是全量。
+   */
+  "/delete/plan": async (_req, body) => {
+    const idsRaw = (Array.isArray(body?.ids) ? body.ids : [body?.id]).filter(Boolean).map(String);
+    const sortedIds = [...new Set(idsRaw)].sort();
+    if (!sortedIds.length) return { ok: false, status: "error", error: "missing ids" };
+    // challengeId + planHash 一起下发。expiresAt 用于 UI 倒计时。
+    const imagesTotal = q1("SELECT COUNT(*) AS c FROM images")?.c ?? 0;
+    const planHash = crypto.createHash("sha256")
+      .update(`${sortedIds.join(",")}|true|${imagesTotal}`)
+      .digest("hex").slice(0, 16);
+    const issued = issueChallenge({ planHash, deleteFile: true, count: sortedIds.length });
+    // 样本：最多 50 条，只作前端展示，不影响后续 /delete 的实际删除。
+    const sampleIds = sortedIds.slice(0, 50);
+    const rows = sampleIds.length
+      ? q(`SELECT id, filename FROM images WHERE id IN (${sampleIds.map(() => "?").join(",")})`, sampleIds)
+      : [];
+    return {
+      ok: true,
+      status: "ok",
+      challengeId: issued.challengeId,
+      planHash: issued.planHash,
+      expiresAt: issued.expiresAt,
+      count: sortedIds.length,
+      deleteFile: true,
+      recoverable: false,
+      targets: rows,
+    };
+  },
+
+  /**
    * 删除。默认只删库记录（不动磁盘，与 /forget 一致）；
    * 传 deleteFile: true 时连磁盘文件一起删。
    *
@@ -2177,21 +2466,50 @@ const routes = {
   "/delete": async (_req, body) => {
     const ids = Array.isArray(body.ids) ? body.ids : [body.id].filter(Boolean);
     if (!ids.length) return { ok: false, status: "error", error: "missing id" };
+
+    // 两段确认：deleteFile: true 时必须先 /delete/plan。
+    // deleteFile 非 true（只删索引）的现有行为一步都不改，也不校验 challenge。
+    if (body.deleteFile === true) {
+      // 复用 validateDeleteChallenge——之前在这里 inline 写了一份等价逻辑，
+      // 函数版定义了却没人调（死代码），二者分叉的风险就是靠这处消除的。
+      // 响应形状保持一致（inline 版冒烟通过），只把校验内核替换掉。
+      const sortedIds = [...new Set(ids.map(String))].sort();
+      const r = validateDeleteChallenge(body, sortedIds);
+      if (!r.ok) {
+        return { ok: false, status: "error", code: r.code, message: r.message };
+      }
+    }
+
     let removed = 0, filesDeleted = 0, filesRequested = 0;
     const errors = [];
     for (const id of ids) {
       const img = q1("SELECT id, path, thumbnail_path FROM images WHERE id = ?", [id]);
       if (!img) continue;
-      if (body.deleteFile === true && img.path && !String(img.path).startsWith("ext:")) {
+      const wantFileDelete = body.deleteFile === true && img.path && !String(img.path).startsWith("ext:");
+
+      // ① 先清 DB —— 顺序关键：ai_content.image_id / image_tags.image_id → images.id
+      //    两条外键都不带 CASCADE，必须先删子表。DB 抛错（FK / UNIQUE / 锁）就
+      //    跳过这条、文件与缩略图都不动，用户重试即可。原来的顺序反了：先 unlink
+      //    再 DELETE，一旦 DB 抛错就留下「文件已删、行还在」，完全不可逆。
+      //    这个顺序与下面 “库记录已删 X 张，但磁盘文件还有 N 个没删掉” 的文案一致。
+      try {
+        run("DELETE FROM ai_content WHERE image_id = ?", [id]);
+        run("DELETE FROM image_tags WHERE image_id = ?", [id]);
+        run("DELETE FROM images WHERE id = ?", [id]);
+      } catch (e) {
+        errors.push({ id, filename: img.filename || "", path: img.path, error: `db: ${e.message}` });
+        continue;
+      }
+      removed++;
+
+      // ② 再删文件 —— 失败走原有 errors 上报；库已删，重新扫描可重新入库。
+      if (wantFileDelete) {
         filesRequested++;
         const r = await unlinkWithRetry(img.path);
         if (r.ok) filesDeleted++;
         else errors.push({ id, filename: img.filename || "", path: img.path, error: r.error });
       }
       if (img.thumbnail_path) { try { fs.unlinkSync(img.thumbnail_path); } catch { /* 已不存在 */ } }
-      run("DELETE FROM image_tags WHERE image_id = ?", [id]);
-      run("DELETE FROM images WHERE id = ?", [id]);
-      removed++;
     }
     return { ok: true, status: "ok", removed, filesRequested, filesDeleted, errors };
   },
@@ -2280,7 +2598,13 @@ const routes = {
       let t = q1("SELECT id FROM tags WHERE name = ?", [name]);
       if (!t) { run("INSERT OR IGNORE INTO tags (name) VALUES (?)", [name]); t = q1("SELECT id FROM tags WHERE name = ?", [name]); }
       if (!t) continue;
-      for (const id of ids) run("INSERT OR IGNORE INTO image_tags (image_id, tag_id) VALUES (?, ?)", [id, t.id]);
+      // 用户显式加标：即使命中已有的 'ai' 归属，也升级为 'user'——
+      // 用户说“我要这个”，归属就该是 user；否则 /ai/clear 会把用户亲自确认过的标签清掉。
+      // （与 AI 侧 /ai/apply 的 INSERT OR IGNORE 相对：AI 侧不覆盖已有行，尊重用户已定的归属。）
+      for (const id of ids) {
+        run(`INSERT INTO image_tags (image_id, tag_id, source) VALUES (?, ?, 'user')
+             ON CONFLICT(image_id, tag_id) DO UPDATE SET source = 'user'`, [id, t.id]);
+      }
     }
     return { ok: true };
   },
@@ -2294,6 +2618,25 @@ const routes = {
       for (const id of ids) run("DELETE FROM image_tags WHERE image_id = ? AND tag_id = ?", [id, t.id]);
     }
     return { ok: true };
+  },
+
+  /**
+   * 整条删除标签：从所有图片上摘掉，再删标签行本身。
+   *
+   * 与 /tags/remove 的区别：那个只从指定图片上摘，标签会留下计数 0 的空壳，
+   * 得再跑 /tags/prune 收尾。这里是「这个标签我不要了」，一次删干净。
+   * 一次可能牵连上千张图，所以前端必须先确认（并把张数摆在确认框里）。
+   * 图片本身一个字节都不动。
+   */
+  "/tags/delete": async (_req, body) => {
+    const name = String(body.name ?? body.tag ?? "").trim();
+    if (!name) return { ok: false, status: "error", code: "MISSING_TAG", message: "缺少标签名" };
+    const t = q1("SELECT id FROM tags WHERE name = ?", [name]);
+    if (!t) return { ok: false, status: "error", code: "TAG_NOT_FOUND", message: "标签不存在" };
+    const removedLinks = q1("SELECT COUNT(*) c FROM image_tags WHERE tag_id = ?", [t.id])?.c ?? 0;
+    run("DELETE FROM image_tags WHERE tag_id = ?", [t.id]);
+    run("DELETE FROM tags WHERE id = ?", [t.id]);
+    return { ok: true, status: "ok", name, removedLinks };
   },
 
   /**
@@ -2395,6 +2738,8 @@ const routes = {
       const img = q1("SELECT thumbnail_path FROM images WHERE id = ?", [id]);
       if (img?.thumbnail_path) { try { fs.unlinkSync(img.thumbnail_path); } catch { /* 已不存在 */ } }
       run("DELETE FROM image_tags WHERE image_id = ?", [id]);
+      // ai_content 也必须先清：外键开之后，不清就会抛 FOREIGN KEY。
+      run("DELETE FROM ai_content WHERE image_id = ?", [id]);
       run("DELETE FROM images WHERE id = ?", [id]);
     }
     return { ok: true, removed: ids.length };
@@ -2459,7 +2804,10 @@ const routes = {
 
   "/db/rebuild": async () => {    const d = openDb();
     d.exec("DELETE FROM images_fts");
-    d.exec("INSERT INTO images_fts(image_id, filename, path) SELECT id, hana_seg(filename), hana_seg(path) FROM images");
+    // 迁移 v4 之后 FTS 是 4 列，rebuild 也必须把 description 灌进去——
+    // 少了它，全库描述从索引里消失，/search 的 LIKE 回退只查 filename/path，
+    // 用户描述过的图再也搜不到。
+    d.exec("INSERT INTO images_fts(image_id, filename, path, description) SELECT id, hana_seg(filename), hana_seg(path), hana_seg(COALESCE(description,'')) FROM images");
     return { ok: true, fts: q1("SELECT COUNT(*) AS c FROM images_fts")?.c ?? 0 };
   },
 
@@ -2541,9 +2889,25 @@ const routes = {
    * 若目标目录因平台写限制拒写，会在 errors 里如实回报。
    */
   "/push": async (_req, body) => {
+    // ── 幂等键处理（新增，与 /scan 同口径） ──
+    // 指纹含 body 参数 + 环境快照（blogImagesPath + 生效 dest）——
+    // 目标目录一变指纹就变，避免同 key 同参数在 TTL 内重发却回放陈旧结果
+    // （外部删了文件、目录被挪走都算）。
     const cfg = readConfig();
     const dest = (typeof body.dest === "string" && body.dest.trim()) ? body.dest.trim() : cfg.blogImagesPath;
-    if (!dest) return { ok: false, error: "需要 dest 参数，或在配置里设置 blogImagesPath" };
+    const idem = checkIdempotency(body, {
+      blogImagesPath: cfg.blogImagesPath,
+      dest,
+    });
+    if (!idem.skipped && !idem.pendingKey && !idem.ok) {
+      return { ok: false, status: "error", code: idem.code, message: idem.message };
+    }
+    if (idem.ok) return { ...idem.result, replayed: true };
+
+    if (!dest) {
+      const _r = { ok: false, error: "需要 dest 参数，或在配置里设置 blogImagesPath" };
+      return finishIdempotency(body, _r, false);
+    }
 
     const rows = q("SELECT id, filename, path FROM images WHERE hidden = 0");
     const dry = body.dry_run === true;
@@ -2552,7 +2916,10 @@ const routes = {
 
     if (!dry) {
       try { fs.mkdirSync(dest, { recursive: true }); }
-      catch (e) { return { ok: false, error: `无法创建目标目录：${e.message}`, dest }; }
+      catch (e) {
+        const _r = { ok: false, error: `无法创建目标目录：${e.message}`, dest };
+        return finishIdempotency(body, _r, false);
+      }
     }
 
     for (const r of rows) {
@@ -2569,7 +2936,8 @@ const routes = {
         if (errors.length < 10) errors.push({ file: r.filename, error: String(e.message).slice(0, 140) });
       }
     }
-    return { ok: true, dryRun: dry, dest, total: rows.length, copied, skipped, failed, errors };
+    const _r = { ok: true, dryRun: dry, dest, total: rows.length, copied, skipped, failed, errors };
+    return finishIdempotency(body, _r, true);
   },
 };
 
