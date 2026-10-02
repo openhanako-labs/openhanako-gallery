@@ -25,7 +25,7 @@
         "description": "浏览、搜索与管理本地图片库；支持标签、日期筛选与 Markdown 引用生成。",
         "route": "/panel.html",
         "cardForm": "flush",
-        "face": { "image": "assets/panel-cover-v2.webp" }
+        "face": { "image": "assets/panel-cover-v3.png" }
       }
     ]
   }
