@@ -2240,7 +2240,7 @@ const routes = {
    *   images.description / ai_name   ← FTS 投影（让现有搜索逻辑不改就能搜到）
    *   image_tags.source='ai'         ← 标记哪些标签是 AI 打的（供 /ai/clear 清理）
    *
-   * 重复识图 → ON CONFFLICT UPDATE ai_content；人工打的标签（source='user'）不动。
+   * 重复识图 → ON CONFLICT UPDATE ai_content；人工打的标签（source='user'）不动。
    */
   "/describe": async (_req, body) => {
     const id = String(body.id || "");
@@ -2265,11 +2265,11 @@ const routes = {
     }
 
     // 1. 权威层：写 ai_content（UPSERT，重复识图会覆写上一次）。
-    //    ON CONFFLICT 更新描述与 tags_json；model/model_version/analyzed_at 也同步更新。
+    //    ON CONFLICT 更新描述与 tags_json；model/model_version/analyzed_at 也同步更新。
     const now = new Date().toISOString();
     run(`INSERT INTO ai_content (image_id, description, tags_json, model, model_version, analyzed_at)
          VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFFLICT(image_id) DO UPDATE SET
+         ON CONFLICT(image_id) DO UPDATE SET
            description = excluded.description,
            tags_json = excluded.tags_json,
            model = excluded.model,
