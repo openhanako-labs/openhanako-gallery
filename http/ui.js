@@ -161,7 +161,17 @@ export default function (app, ctx) {
     const body = await c.req.json().catch(() => ({}));
     return c.json(await callService("/missing", body));
   });
-  app.post("/missing/purge", async (c) => c.json(await callService("/missing/purge")));
+  /**
+   * 失效记录的清理（第二段）。
+   *
+   * 必须读 body —— 第二段要带 challengeId + planHash，漏读就等于永远 PLAN_REQUIRED。
+   * 这个口子此前一直敞着：按钮点了报「需要先调用 /missing/purge/plan」，
+   * 而调用方明明刚刚调过。与 /delete、/forget 保持同一种写法。
+   */
+  app.post("/missing/purge", async (c) => {
+    const body = await c.req.json().catch(() => ({}));
+    return c.json(await callService("/missing/purge", body));
+  });
 
   /**
    * 两段清理的第一段：只签发风险计划，不删任何东西。

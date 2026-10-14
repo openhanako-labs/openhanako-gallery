@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Hanako Gallery</title>
+<title>图库</title>
 <link rel="stylesheet" href="./assets/panel.css">
 <!--
   告诉宿主「这个页面起来了」。
@@ -42,6 +42,7 @@
     </div>
 
     <div class="transport">
+      <button class="icon-btn" type="button" onclick="refreshLibrary()" id="refreshBtn" title="刷新：扫描新文件 + 检查失效记录">🔄</button>
       <button class="icon-btn" type="button" onclick="prePage()" title="上一页">◀</button>
       <span class="stats" id="stats">—</span>
       <button class="icon-btn" type="button" onclick="nextPage()" title="下一页">▶</button>
@@ -92,6 +93,15 @@
   <!-- ═══ 标签栏（由 panel.js 渲染） ═══ -->
   <div class="tagbar" id="tagbar">
     <span class="tag tag-all active" onclick="filterAll()">全部</span>
+  </div>
+
+  <!-- 失效记录提示条：刷新后发现库里记着、磁盘上已经没有的文件时出现。
+       只提示不动手 —— 清理要用户再点一次（两段确认）。 -->
+  <div class="missbar" id="missBar" hidden>
+    <span class="missbar-ic">⚠</span>
+    <span class="missbar-tx" id="missText"></span>
+    <button class="modal-btn danger" type="button" onclick="purgeMissing()" id="missPurgeBtn">🧹 清理</button>
+    <button class="modal-btn" type="button" onclick="dismissMissing()">忽略</button>
   </div>
 
   <!-- 批量选择条：只在多选模式下出现。 -->

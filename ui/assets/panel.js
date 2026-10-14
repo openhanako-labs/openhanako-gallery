@@ -1439,8 +1439,10 @@
       });
       var d = await r.json();
       if (!d.ok) return showMsg("清理失败: " + (d.message || d.error || d.code || "未知原因"), "error");
+      // 两个入口（设置抽屉 / 刷新提示条）共用这个函数，两处的容器都要收。
       var box = document.getElementById("missingBox");
       if (box) box.hidden = true;
+      dismissMissing();
       showMsg("已清理 " + d.removed + " 条失效记录（顺带删了 " + (d.thumbs || 0) + " 张缩略图缓存）；磁盘文件没动。", "success");
       if (d.removed) await load();
     } catch (e) {
@@ -1848,6 +1850,78 @@
 
   /* ── 链接导入 / 外链 ──────────────────────────────────── */
 
+  /* ── 手动刷新（顶栏 🔄） ────────────────────────── */
+
+  /**
+   * 刷新 = 扫盘拉新增 + 检查失效记录，两步一起做，最后重载视图。
+   *
+   * 为什么把两件事捆在一起：
+   *   · 面板开屏本来就会自动扫一次新增（autoRefresh），但它是静默的、被 60s 节流的，
+   *     而且**从不反向检查失效** —— 用户在资源管理器里删掉的文件会永远赖在库里。
+   *   · 用户要的是一个「我说了算」的入口：按下去，不管节流、不管静默，
+   *     该看到的都看到。所以这里用 force 绕过节流，并把失效一并报出来。
+   *
+   * 失效**只报不删** —— 不自动碰用户的库，保持两段确认。
+   */
+  async function refreshLibrary() {
+    var btn = document.getElementById("refreshBtn");
+    if (btn) { btn.disabled = true; btn.style.opacity = ".45"; btn.textContent = "⏳"; }
+    try {
+      // ① 扫盘：force 绕过服务端 60s 节流（用户主动点的，不能被拦）
+      var r = await apiFetch("/import", {
+        method: "POST", headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ showVideo: true, force: true }),
+      });
+      var d = await r.json();
+      var s = d.summary || d;
+      if (!(d.status === "ok" || d.ok)) {
+        showMsg("刷新失败: " + (d.error || "未知原因"), "error");
+        return;
+      }
+      var added = s.imported || 0, updated = s.updated || 0;
+
+      // ② 查失效（与扫盘同一轮，用户看到的两个数字才是同一时刻的）
+      var mr = await apiFetch("/missing", {
+        method: "POST", headers: { "Content-Type": "application/json" }, body: "{}",
+      });
+      var md = await mr.json();
+      var missing = md && md.ok ? (md.missing || 0) : 0;
+
+      // ③ 贴结果
+      var parts = [];
+      if (added) parts.push("新增 " + added);
+      if (updated) parts.push("更新 " + updated);
+      showMsg(parts.length ? "已刷新：" + parts.join(" / ") : "已刷新：没有变化", "success");
+
+      if (missing > 0) {
+        var tx = document.getElementById("missText");
+        if (tx) {
+          var eg = (md.samples || []).slice(0, 2).map(function (x) { return x.filename; }).join("、");
+          tx.textContent = "有 " + missing + " 条记录的文件已经不在原位"
+            + (eg ? "（例如：" + eg + "）" : "")
+            + "。清理只删索引与缩略图缓存，不动磁盘；文件只是被移走的话，重新扫描会以新路径再入库。";
+        }
+        var bar = document.getElementById("missBar");
+        if (bar) bar.hidden = false;
+      } else {
+        dismissMissing();
+      }
+
+      // ④ 重载视图（有变化才重载，没变化不动 —— 避免白闪一下）
+      if (added || updated) { loadFolders(); load(); }
+    } catch (e) {
+      showMsg("刷新出错: " + e.message, "error");
+    } finally {
+      if (btn) { btn.disabled = false; btn.style.opacity = ""; btn.textContent = "\uD83D\uDD04"; }
+    }
+  }
+
+  /** 收起失效提示条（「忽略」，或刷新后确认没有失效）。 */
+  function dismissMissing() {
+    var bar = document.getElementById("missBar");
+    if (bar) bar.hidden = true;
+  }
+
   function previewImportUrl() {
     var url = document.getElementById("importUrlInput").value.trim();
     if (!url) return;
@@ -2050,6 +2124,7 @@
     openSettings: openSettings, closeSettings: closeSettings,
     addScanPath: addScanPath, saveConfig: saveConfig, refreshGenSources: refreshGenSources,
     triggerRebuild: triggerRebuild, triggerImport: triggerImport,
+    refreshLibrary: refreshLibrary, dismissMissing: dismissMissing,
     previewImportUrl: previewImportUrl, confirmImportUrl: confirmImportUrl,
     addExternalUrl: addExternalUrl,
     toggleView: toggleView, changeGridSize: changeGridSize,

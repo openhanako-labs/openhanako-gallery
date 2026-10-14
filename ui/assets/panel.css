@@ -366,6 +366,27 @@ button { cursor: pointer; border: 0; background: transparent; }
 }
 .selbar-confirm[hidden] { display: none; }
 
+/* 失效记录提示条：刷新后发现「库里记着、磁盘上没了」的文件时冒出来。
+   用 warn 色而不是 danger —— 它是提醒，不是错误；真正的破坏性动作在「清理」那颗按钮上。
+   与 .selbar 同层（标签栏与网格之间），共用一个显隐约定：#missBar[hidden] 由文件末尾的
+   [hidden]{display:none!important} 兜底，这里不必再写一遍。 */
+.missbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 6px 14px;
+  background: var(--g-warn-bg);
+  color: var(--g-warn);
+  font-size: 11.5px;
+  line-height: 1.6;
+  border-bottom: 1px solid var(--g-divider);
+}
+.missbar-ic { font-size: 12px; line-height: 1; }
+.missbar-tx { flex: 1; min-width: 0; }
+.missbar .modal-btn { flex: 0 0 auto; height: 24px; font-size: 11px; padding: 0 10px; }
+.missbar .modal-btn.danger { background: var(--g-bar); }
+
 /* 可拖动排序的标签：拉起来时给点反馈，拖到谁身上谁就亮一个插入位。 */
 .tag[draggable="true"] { cursor: grab; }
 .tag.dragging { opacity: .45; cursor: grabbing; }

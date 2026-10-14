@@ -1526,7 +1526,7 @@ footer{max-width:1200px;margin:40px auto 0;font-size:11px;color:var(--soft);bord
   <div class="meta">${rows.length} 张图片 · 导出于 ${escapeHtml(new Date().toLocaleString("zh-CN"))}</div>
 </header>
 ${sections || '  <div class="empty">没有匹配的图片。</div>'}
-<footer>由 Hanako Gallery 生成 · 图片引用本地文件路径</footer>
+<footer>由图库生成 · 图片引用本地文件路径</footer>
 </body>
 </html>
 `;

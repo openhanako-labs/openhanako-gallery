@@ -1,4 +1,4 @@
-# Hanako Gallery — 助手使用引导
+# 图库（Hanako Gallery） — 助手使用引导
 
 > 插件 ID: `hanako-gallery`
 > 版本: `0.5.0`（v2 App，`manifestVersion: 2`）
