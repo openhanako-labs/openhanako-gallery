@@ -38,6 +38,13 @@ const PORT = Number(process.argv[3]) || 43180;
  * 由 AppHost 显式传入，拿不到时再回退推导。
  */
 const HANA_HOME = process.argv[4] || process.env.HANA_HOME || path.dirname(path.dirname(DATA_DIR));
+/**
+ * 调用方密钥（argv[5]，可缺省）。
+ * 由 AppHost 在 args 末位注入；服务侧对每个请求校验 X-Hanako-Service-Key，
+ * 用 timingSafeEqual 常时比较。缺省（旧版 AppHost 未传）走 fail-closed：全部 403。
+ * token 每次服务重启由 AppHost 重新生成，进程内不落盘、不进 env。
+ */
+const AUTH_TOKEN = process.argv[5] || "";
 const READY_MARKER = "HANA_GALLERY_SERVICE_READY";
 
 /** 单张图片回传上限。base64 后约 1.33 倍，卡在宿主 4MB 响应上限内。 */
@@ -1412,8 +1419,110 @@ function coerceQuery(v) {
   return v;
 }
 
+// ── 受管服务鉴权闸（PR #99 安全审查）──
+// guard 放在所有业务代码之前，任一不满足直接短路返回，不触达 routes 分发。
+const AUTH_FAILED = { ok: false, error: "unauthorized" };
+
+// 拒绝细节只进 service.log（不进响应体，避免给攻击者指纹/确认）。
+function logReject(reason, req) {
+  try {
+    const u = new URL(req.url, "http://127.0.0.1");
+    const line = `[鉴权拒绝 ${new Date().toISOString()}] ${reason}`
+      + ` | host=${req.headers.host || ""}`
+      + ` | origin=${req.headers.origin || ""}`
+      + ` | secFetch=${req.headers["sec-fetch-site"] || ""}/${req.headers["sec-fetch-mode"] || ""}`
+      + ` | method=${req.method} | path=${u.pathname}\n`;
+    fs.appendFileSync(path.join(DATA_DIR, "service.log"), line);
+  } catch { /* 落盘失败不阻断请求 */ }
+}
+
+let _warnedNoToken = false;
+
+/**
+ * G1+G2 闸：返回 false 时已就 json() 返回，调用方直接 return。
+ * G1 调用方密钥：每个请求（含 /status）验 X-Hanako-Service-Key，timingSafeEqual 常时比较；
+ *   缺 token（旧 AppHost 未传）走 fail-closed 全部 403，仅告警一次。
+ * G2 Host/浏览器指纹：合法调用方是宿主桥进程内 fetch，Host 必为 127.0.0.1/localhost:<PORT>，
+ *   且绝不带 Origin / Sec-Fetch-*；其余一律 403，Host 不匹配时把实际值写进 service.log 作实测钩子。
+ */
+function guard(req, res) {
+  const h = req.headers;
+  const provided = typeof h["x-hanako-service-key"] === "string" ? h["x-hanako-service-key"] : "";
+  const expected = AUTH_TOKEN;
+  if (!expected) {
+    if (!_warnedNoToken) { _warnedNoToken = true; logReject("服务未收到调用方密钥（fail-closed：全部请求 403）", req); }
+    json(res, 403, AUTH_FAILED);
+    return false;
+  }
+  if (!provided || provided.length !== expected.length
+      || !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(expected))) {
+    logReject("调用方密钥不匹配", req);
+    json(res, 403, AUTH_FAILED);
+    return false;
+  }
+  // G2：浏览器跨站指纹。注意不能「见 Sec-Fetch-* 就拒」：新版 undici/Node 的服务端
+  // fetch 也会带 sec-fetch-mode（实测本机 Node v24 即如此），会误杀宿主桥。
+  // 浏览器攻击的判别特征是 Origin 头与 Sec-Fetch-Site（浏览器恒带 site，服务端客户端不带）。
+  if (h.origin || (h["sec-fetch-site"] && h["sec-fetch-site"] !== "none")) {
+    logReject(`陌生来源指纹 origin=${h.origin || ""} sec-fetch-site=${h["sec-fetch-site"] || ""} sec-fetch-mode=${h["sec-fetch-mode"] || ""}`, req);
+    json(res, 403, AUTH_FAILED);
+    return false;
+  }
+  // G2：Host 白名单（宿主桥的真实 Host 实测后锁死；当前先记录不匹配值）
+  const host = h.host || "";
+  if (host !== `127.0.0.1:${PORT}` && host !== `localhost:${PORT}`) {
+    logReject(`Host 不在白名单（实际=${host}）`, req);
+    json(res, 403, AUTH_FAILED);
+    return false;
+  }
+  return true;
+}
+
+/**
+ * G5 落盘/路径类参数收紧：candidate 必须 resolve 到 baseDir（授权目录）以内，
+ * 否则抛带 httpStatus 的错，由入口转 HTTP 400。path.resolve 后对最深已存在祖先
+ * realpathSync（防 .. 穿越 / 符号链接逃逸），再前缀校验。
+ */
+function safeResolveWithin(candidate, baseDir) {
+  const abs = path.normalize(path.resolve(String(candidate).trim()));
+  const baseAbs = path.normalize(path.resolve(String(baseDir).trim()));
+  let cur = abs;
+  while (cur && cur !== path.dirname(cur)) {
+    if (fs.existsSync(cur)) break;
+    cur = path.dirname(cur);
+  }
+  const realAnchor = fs.existsSync(cur) ? fs.realpathSync(cur) : cur;
+  let bcur = baseAbs;
+  while (bcur && bcur !== path.dirname(bcur)) {
+    if (fs.existsSync(bcur)) break;
+    bcur = path.dirname(bcur);
+  }
+  const realBase = fs.existsSync(bcur) ? fs.realpathSync(bcur) : bcur;
+  const within = realAnchor === realBase || realAnchor.startsWith(realBase + path.sep);
+  if (!within) {
+    throw Object.assign(new Error("路径越界"), { httpStatus: 400, httpError: "路径越界：必须落在授权目录以内" });
+  }
+  return abs;
+}
+
+// G3 写路由清单：POST-only 且彻底忽略 query string。callService 恒 POST，正常调用不受影响。
+const WRITE_ROUTES = new Set([
+  "/config/set", "/scan", "/tags", "/tags/add", "/tags/remove", "/tags/delete",
+  "/tags/prune", "/missing/purge", "/missing/purge/plan", "/ai/clear", "/describe",
+  "/embed/build/start", "/embed/build/cancel", "/rename", "/delete/plan", "/delete",
+  "/import-url", "/add-external", "/thumb", "/forget", "/open", "/reveal",
+  "/db/rebuild", "/generate", "/export", "/push",
+]);
+
 function readBody(req) {
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    // G4：Content-Type 必须为 application/json（允许 ;charset= 后缀）；
+    //   跨站 no-cors 只能发 text/plain 等简单类型，这条直接堵死其被当 JSON 操作。
+    const ct = String(req.headers["content-type"] || "").split(";")[0].trim().toLowerCase();
+    if (ct !== "application/json") {
+      reject(Object.assign(new Error("unsupported media type"), { httpStatus: 415, httpError: "unsupported media type：仅接受 application/json" }));
+      return;
+    }
     const chunks = [];
     let size = 0;
     req.on("data", (c) => {
@@ -1422,8 +1531,18 @@ function readBody(req) {
       chunks.push(c);
     });
     req.on("end", () => {
-      try { resolve(JSON.parse(Buffer.concat(chunks).toString("utf-8"))); }
-      catch { resolve({}); }
+      let parsed;
+      try { parsed = JSON.parse(Buffer.concat(chunks).toString("utf-8")); }
+      catch {
+        reject(Object.assign(new Error("invalid json"), { httpStatus: 400, httpError: "invalid json body" }));
+        return;
+      }
+      // G4：必须是非数组对象，否则 400（数组/基本类型无类型信息、易被误用）
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+        reject(Object.assign(new Error("body 必须为对象"), { httpStatus: 400, httpError: "body 必须为 JSON 对象（非数组）" }));
+        return;
+      }
+      resolve(parsed);
     });
     req.on("error", () => resolve({}));
   });
@@ -1436,9 +1555,9 @@ function stamp() {
   return `${d.getFullYear()}${p(d.getMonth() + 1)}${p(d.getDate())}-${p(d.getHours())}${p(d.getMinutes())}${p(d.getSeconds())}`;
 }
 
-/** 解析输出路径；缺省落到 app-data/exports/。 */
+/** 解析输出路径；缺省落到 app-data/exports/。G5：自定义 output 必须落在 EXPORT_DIR 以内，越界抛 400。 */
 function resolveOutput(output, defaultName) {
-  if (typeof output === "string" && output.trim()) return path.resolve(output.trim());
+  if (typeof output === "string" && output.trim()) return safeResolveWithin(output, EXPORT_DIR);
   return path.join(EXPORT_DIR, defaultName);
 }
 
@@ -2519,7 +2638,10 @@ const routes = {
     const raw = String(body.url || "").trim();
     if (!/^https?:\/\//i.test(raw)) return { ok: false, status: "error", error: "需要 http(s) URL" };
     const cfg = readConfig();
-    const destDir = (typeof body.dir === "string" && body.dir.trim()) ? body.dir.trim() : cfg.galleryRoot;
+    // G5：dir 必须落在 galleryRoot 以内（防任意路径落盘）；越界抛 400 由入口转 HTTP 400。
+    const destDir = (typeof body.dir === "string" && body.dir.trim())
+      ? safeResolveWithin(body.dir, cfg.galleryRoot)
+      : cfg.galleryRoot;
 
     let u;
     try { u = new URL(raw); } catch { return { ok: false, status: "error", error: "URL 无法解析" }; }
@@ -2894,7 +3016,10 @@ const routes = {
     // 目标目录一变指纹就变，避免同 key 同参数在 TTL 内重发却回放陈旧结果
     // （外部删了文件、目录被挪走都算）。
     const cfg = readConfig();
-    const dest = (typeof body.dest === "string" && body.dest.trim()) ? body.dest.trim() : cfg.blogImagesPath;
+    // G5：dest 必须落在 blogImagesPath 以内（缺省即缺省行为）；越界抛 400 由入口转 HTTP 400。
+    const dest = (typeof body.dest === "string" && body.dest.trim())
+      ? safeResolveWithin(body.dest, cfg.blogImagesPath)
+      : cfg.blogImagesPath;
     const idem = checkIdempotency(body, {
       blogImagesPath: cfg.blogImagesPath,
       dest,
@@ -2942,16 +3067,32 @@ const routes = {
 };
 
 const server = http.createServer(async (req, res) => {
+  // G1+G2 闸：任何业务代码之前短路
+  if (!guard(req, res)) return;
+
   const url = new URL(req.url, "http://127.0.0.1");
-  const handler = routes[url.pathname];
-  if (!handler) return json(res, 404, { ok: false, error: "no such route: " + url.pathname });
-  let body = {};
-  // GET：query string 是参数来源；POST：body 是参数来源。两边可叠加。
-  for (const [k, v] of url.searchParams) body[k] = coerceQuery(v);
-  if (req.method === "POST") Object.assign(body, await readBody(req));
+  const pathname = url.pathname;
+  const handler = routes[pathname];
+  if (!handler) return json(res, 404, { ok: false, error: "no such route: " + pathname });
+
+  let body;
   try {
+    if (WRITE_ROUTES.has(pathname)) {
+      // G3：写路由 POST-only，参数只认 body，完全忽略 query string
+      if (req.method !== "POST") {
+        return json(res, 405, { ok: false, error: "method not allowed：写路由仅接受 POST" });
+      }
+      body = await readBody(req);
+    } else {
+      // 只读路由：保留原 query 合并逻辑（GET query；POST body 叠加）
+      body = {};
+      for (const [k, v] of url.searchParams) body[k] = coerceQuery(v);
+      if (req.method === "POST") Object.assign(body, await readBody(req));
+    }
     json(res, 200, await handler(req, body));
   } catch (e) {
+    // G4/G5 等鉴权/格式错误带 httpStatus，直接映射对应 HTTP 状态码；其余按 500。
+    if (e?.httpStatus) return json(res, e.httpStatus, { ok: false, error: e.httpError || String(e.message) });
     json(res, 500, { ok: false, error: String(e?.stack || e).slice(0, 800) });
   }
 });
